@@ -1,5 +1,8 @@
 > **THIS IS A TEST REPOSITORY FOR ADP; DO NOT USE THIS REPOSITORY FOR ACTUAL CVES**
+>
 > For actual CVEs, use https://github.com/CVEProject/cvelistV5 instead
+>
+> As of 2024-05-29T20:58:28.850Z, this repository can be considered a complete cache for the adp-test server
 
 # CVE List V5
 
