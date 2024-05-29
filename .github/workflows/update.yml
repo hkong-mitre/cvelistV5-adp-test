@@ -28,7 +28,7 @@ jobs:
     environment: deployment
     runs-on: ubuntu-latest
     env:
-      CVE_SERVICES_URL: https://cveawg.mitre.org
+      CVE_SERVICES_URL: https://cveawg-adp-test.mitre.org
       CVES_BASE_DIRECTORY: cves
       CVES_RECENT_ACTIVITIES_FILENAME: recent_activities.json
       CVES_DEFAULT_UPDATE_LOOKBACK_IN_MINS: 180
