@@ -23,6 +23,8 @@ on:
         default: ''
 jobs:
   update-cves:
+    permissions:
+      contents: write
     environment: deployment
     runs-on: ubuntu-latest
     env:
