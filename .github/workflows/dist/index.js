@@ -617,7 +617,8 @@ module.exports = function (/**String*/ input, /** object */ options) {
          *
          * @return Array
          */
-        getEntries: function () {
+        getEntries: function (/**String*/ password) {
+            _zip.password=password;
             return _zip ? _zip.entries : [];
         },
 
@@ -694,7 +695,7 @@ module.exports = function (/**String*/ input, /** object */ options) {
                 return true;
             }
 
-            var content = item.getData();
+            var content = item.getData(_zip.password);
             if (!content) throw new Error(Utils.Errors.CANT_EXTRACT_FILE);
 
             if (filetools.fs.existsSync(target) && !overwrite) {
@@ -856,9 +857,9 @@ module.exports = function (/**String*/ input, /** object */ options) {
                                     callback(getError("Unable to set times", filePath));
                                     return;
                                 }
-                                fileEntries.delete(entry);
                                 // call the callback if it was last entry
                                 done();
+                                fileEntries.delete(entry);
                             });
                         });
                     }
@@ -1022,7 +1023,9 @@ module.exports = function () {
         set time(val) {
             setTime(val);
         },
-
+        get timeHighByte() {
+            return (_time >>> 8) & 0xff;
+        },
         get crc() {
             return _crc;
         },
@@ -1635,8 +1638,12 @@ function decrypt(/*Buffer*/ data, /*Object*/ header, /*String, Buffer*/ pwd) {
     // 2. decrypt salt what is always 12 bytes and is a part of file content
     const salt = decrypter(data.slice(0, 12));
 
-    // 3. does password meet expectations
-    if (salt[11] !== header.crc >>> 24) {
+    // if bit 3 (0x08) of the general-purpose flags field is set, check salt[11] with the high byte of the header time
+    // 2 byte data block (as per Info-Zip spec), otherwise check with the high byte of the header entry
+    const verifyByte = ((header.flags & 0x8) === 0x8) ? header.timeHighByte : header.crc >>> 24;
+
+    //3. does password meet expectations
+    if (salt[11] !== verifyByte) {
         throw "ADM-ZIP: Wrong Password";
     }
 
@@ -2602,6 +2609,7 @@ module.exports = function (/*Buffer|null*/ inBuffer, /** object */ options) {
         _comment = Buffer.alloc(0),
         mainHeader = new Headers.MainHeader(),
         loadedEntries = false;
+    var password = null;
 
     // assign options
     const opts = Object.assign(Object.create(null), options);
@@ -2853,7 +2861,7 @@ module.exports = function (/*Buffer|null*/ inBuffer, /** object */ options) {
                 // 1.2. postheader - data after data header
                 const postHeader = Buffer.alloc(entryNameLen + entry.extra.length);
                 entry.rawEntryName.copy(postHeader, 0);
-                postHeader.copy(entry.extra, entryNameLen);
+                entry.extra.copy(postHeader, entryNameLen);
 
                 // 2. offsets
                 const dataLength = dataHeader.length + postHeader.length + compressedData.length;
@@ -25450,11 +25458,11 @@ function getDate() {
 }
 
 /**
- * Invokes `util.format()` with the specified arguments and writes to stderr.
+ * Invokes `util.formatWithOptions()` with the specified arguments and writes to stderr.
  */
 
 function log(...args) {
-	return process.stderr.write(util.format(...args) + '\n');
+	return process.stderr.write(util.formatWithOptions(exports.inspectOpts, ...args) + '\n');
 }
 
 /**
@@ -25700,11 +25708,13 @@ function _parseVault (options) {
   // Parse .env.vault
   const result = DotenvModule.configDotenv({ path: vaultPath })
   if (!result.parsed) {
-    throw new Error(`MISSING_DATA: Cannot parse ${vaultPath} for an unknown reason`)
+    const err = new Error(`MISSING_DATA: Cannot parse ${vaultPath} for an unknown reason`)
+    err.code = 'MISSING_DATA'
+    throw err
   }
 
   // handle scenario for comma separated keys - for use with key rotation
-  // example: DOTENV_KEY="dotenv://:key_1234@dotenv.org/vault/.env.vault?environment=prod,dotenv://:key_7890@dotenv.org/vault/.env.vault?environment=prod"
+  // example: DOTENV_KEY="dotenv://:key_1234@dotenvx.com/vault/.env.vault?environment=prod,dotenv://:key_7890@dotenvx.com/vault/.env.vault?environment=prod"
   const keys = _dotenvKey(options).split(',')
   const length = keys.length
 
@@ -25768,7 +25778,9 @@ function _instructions (result, dotenvKey) {
     uri = new URL(dotenvKey)
   } catch (error) {
     if (error.code === 'ERR_INVALID_URL') {
-      throw new Error('INVALID_DOTENV_KEY: Wrong format. Must be in valid uri format like dotenv://:key_1234@dotenv.org/vault/.env.vault?environment=development')
+      const err = new Error('INVALID_DOTENV_KEY: Wrong format. Must be in valid uri format like dotenv://:key_1234@dotenvx.com/vault/.env.vault?environment=development')
+      err.code = 'INVALID_DOTENV_KEY'
+      throw err
     }
 
     throw error
@@ -25777,34 +25789,53 @@ function _instructions (result, dotenvKey) {
   // Get decrypt key
   const key = uri.password
   if (!key) {
-    throw new Error('INVALID_DOTENV_KEY: Missing key part')
+    const err = new Error('INVALID_DOTENV_KEY: Missing key part')
+    err.code = 'INVALID_DOTENV_KEY'
+    throw err
   }
 
   // Get environment
   const environment = uri.searchParams.get('environment')
   if (!environment) {
-    throw new Error('INVALID_DOTENV_KEY: Missing environment part')
+    const err = new Error('INVALID_DOTENV_KEY: Missing environment part')
+    err.code = 'INVALID_DOTENV_KEY'
+    throw err
   }
 
   // Get ciphertext payload
   const environmentKey = `DOTENV_VAULT_${environment.toUpperCase()}`
   const ciphertext = result.parsed[environmentKey] // DOTENV_VAULT_PRODUCTION
   if (!ciphertext) {
-    throw new Error(`NOT_FOUND_DOTENV_ENVIRONMENT: Cannot locate environment ${environmentKey} in your .env.vault file.`)
+    const err = new Error(`NOT_FOUND_DOTENV_ENVIRONMENT: Cannot locate environment ${environmentKey} in your .env.vault file.`)
+    err.code = 'NOT_FOUND_DOTENV_ENVIRONMENT'
+    throw err
   }
 
   return { ciphertext, key }
 }
 
 function _vaultPath (options) {
-  let dotenvPath = path.resolve(process.cwd(), '.env')
+  let possibleVaultPath = null
 
   if (options && options.path && options.path.length > 0) {
-    dotenvPath = options.path
+    if (Array.isArray(options.path)) {
+      for (const filepath of options.path) {
+        if (fs.existsSync(filepath)) {
+          possibleVaultPath = filepath.endsWith('.vault') ? filepath : `${filepath}.vault`
+        }
+      }
+    } else {
+      possibleVaultPath = options.path.endsWith('.vault') ? options.path : `${options.path}.vault`
+    }
+  } else {
+    possibleVaultPath = path.resolve(process.cwd(), '.env.vault')
   }
 
-  // Locate .env.vault
-  return dotenvPath.endsWith('.vault') ? dotenvPath : `${dotenvPath}.vault`
+  if (fs.existsSync(possibleVaultPath)) {
+    return possibleVaultPath
+  }
+
+  return null
 }
 
 function _resolveHome (envPath) {
@@ -25827,51 +25858,73 @@ function _configVault (options) {
 }
 
 function configDotenv (options) {
-  let dotenvPath = path.resolve(process.cwd(), '.env')
+  const dotenvPath = path.resolve(process.cwd(), '.env')
   let encoding = 'utf8'
   const debug = Boolean(options && options.debug)
 
-  if (options) {
-    if (options.path != null) {
-      dotenvPath = _resolveHome(options.path)
-    }
-    if (options.encoding != null) {
-      encoding = options.encoding
+  if (options && options.encoding) {
+    encoding = options.encoding
+  } else {
+    if (debug) {
+      _debug('No encoding is specified. UTF-8 is used by default')
     }
   }
 
-  try {
-    // Specifying an encoding returns a string instead of a buffer
-    const parsed = DotenvModule.parse(fs.readFileSync(dotenvPath, { encoding }))
-
-    let processEnv = process.env
-    if (options && options.processEnv != null) {
-      processEnv = options.processEnv
+  let optionPaths = [dotenvPath] // default, look for .env
+  if (options && options.path) {
+    if (!Array.isArray(options.path)) {
+      optionPaths = [_resolveHome(options.path)]
+    } else {
+      optionPaths = [] // reset default
+      for (const filepath of options.path) {
+        optionPaths.push(_resolveHome(filepath))
+      }
     }
+  }
 
-    DotenvModule.populate(processEnv, parsed, options)
+  // Build the parsed data in a temporary object (because we need to return it).  Once we have the final
+  // parsed data, we will combine it with process.env (or options.processEnv if provided).
+  let lastError
+  const parsedAll = {}
+  for (const path of optionPaths) {
+    try {
+      // Specifying an encoding returns a string instead of a buffer
+      const parsed = DotenvModule.parse(fs.readFileSync(path, { encoding }))
 
-    return { parsed }
-  } catch (e) {
-    if (debug) {
-      _debug(`Failed to load ${dotenvPath} ${e.message}`)
+      DotenvModule.populate(parsedAll, parsed, options)
+    } catch (e) {
+      if (debug) {
+        _debug(`Failed to load ${path} ${e.message}`)
+      }
+      lastError = e
     }
+  }
 
-    return { error: e }
+  let processEnv = process.env
+  if (options && options.processEnv != null) {
+    processEnv = options.processEnv
+  }
+
+  DotenvModule.populate(processEnv, parsedAll, options)
+
+  if (lastError) {
+    return { parsed: parsedAll, error: lastError }
+  } else {
+    return { parsed: parsedAll }
   }
 }
 
 // Populates process.env from .env file
 function config (options) {
-  const vaultPath = _vaultPath(options)
-
   // fallback to original dotenv if DOTENV_KEY is not set
   if (_dotenvKey(options).length === 0) {
     return DotenvModule.configDotenv(options)
   }
 
+  const vaultPath = _vaultPath(options)
+
   // dotenvKey exists but .env.vault file does not exist
-  if (!fs.existsSync(vaultPath)) {
+  if (!vaultPath) {
     _warn(`You set DOTENV_KEY but you are missing a .env.vault file at ${vaultPath}. Did you forget to build it?`)
 
     return DotenvModule.configDotenv(options)
@@ -25884,9 +25937,9 @@ function decrypt (encrypted, keyStr) {
   const key = Buffer.from(keyStr.slice(-64), 'hex')
   let ciphertext = Buffer.from(encrypted, 'base64')
 
-  const nonce = ciphertext.slice(0, 12)
-  const authTag = ciphertext.slice(-16)
-  ciphertext = ciphertext.slice(12, -16)
+  const nonce = ciphertext.subarray(0, 12)
+  const authTag = ciphertext.subarray(-16)
+  ciphertext = ciphertext.subarray(12, -16)
 
   try {
     const aesgcm = crypto.createDecipheriv('aes-256-gcm', key, nonce)
@@ -25898,14 +25951,14 @@ function decrypt (encrypted, keyStr) {
     const decryptionFailed = error.message === 'Unsupported state or unable to authenticate data'
 
     if (isRange || invalidKeyLength) {
-      const msg = 'INVALID_DOTENV_KEY: It must be 64 characters long (or more)'
-      throw new Error(msg)
+      const err = new Error('INVALID_DOTENV_KEY: It must be 64 characters long (or more)')
+      err.code = 'INVALID_DOTENV_KEY'
+      throw err
     } else if (decryptionFailed) {
-      const msg = 'DECRYPTION_FAILED: Please check your DOTENV_KEY'
-      throw new Error(msg)
+      const err = new Error('DECRYPTION_FAILED: Please check your DOTENV_KEY')
+      err.code = 'DECRYPTION_FAILED'
+      throw err
     } else {
-      console.error('Error: ', error.code)
-      console.error('Error: ', error.message)
       throw error
     }
   }
@@ -25917,7 +25970,9 @@ function populate (processEnv, parsed, options = {}) {
   const override = Boolean(options && options.override)
 
   if (typeof parsed !== 'object') {
-    throw new Error('OBJECT_REQUIRED: Please check the processEnv argument being passed to populate')
+    const err = new Error('OBJECT_REQUIRED: Please check the processEnv argument being passed to populate')
+    err.code = 'OBJECT_REQUIRED'
+    throw err
   }
 
   // Set process.env
@@ -25996,6 +26051,30 @@ var Writable = (__nccwpck_require__(2781).Writable);
 var assert = __nccwpck_require__(9491);
 var debug = __nccwpck_require__(1133);
 
+// Whether to use the native URL object or the legacy url module
+var useNativeURL = false;
+try {
+  assert(new URL());
+}
+catch (error) {
+  useNativeURL = error.code === "ERR_INVALID_URL";
+}
+
+// URL fields to preserve in copy operations
+var preservedUrlFields = [
+  "auth",
+  "host",
+  "hostname",
+  "href",
+  "path",
+  "pathname",
+  "port",
+  "protocol",
+  "query",
+  "search",
+  "hash",
+];
+
 // Create handlers that pass events from native requests
 var events = ["abort", "aborted", "connect", "error", "socket", "timeout"];
 var eventHandlers = Object.create(null);
@@ -26005,19 +26084,20 @@ events.forEach(function (event) {
   };
 });
 
+// Error types with codes
 var InvalidUrlError = createErrorType(
   "ERR_INVALID_URL",
   "Invalid URL",
   TypeError
 );
-// Error types with codes
 var RedirectionError = createErrorType(
   "ERR_FR_REDIRECTION_FAILURE",
   "Redirected request failed"
 );
 var TooManyRedirectsError = createErrorType(
   "ERR_FR_TOO_MANY_REDIRECTS",
-  "Maximum number of redirects exceeded"
+  "Maximum number of redirects exceeded",
+  RedirectionError
 );
 var MaxBodyLengthExceededError = createErrorType(
   "ERR_FR_MAX_BODY_LENGTH_EXCEEDED",
@@ -26052,7 +26132,13 @@ function RedirectableRequest(options, responseCallback) {
   // React to responses of native requests
   var self = this;
   this._onNativeResponse = function (response) {
-    self._processResponse(response);
+    try {
+      self._processResponse(response);
+    }
+    catch (cause) {
+      self.emit("error", cause instanceof RedirectionError ?
+        cause : new RedirectionError({ cause: cause }));
+    }
   };
 
   // Perform the first request
@@ -26270,8 +26356,7 @@ RedirectableRequest.prototype._performRequest = function () {
   var protocol = this._options.protocol;
   var nativeProtocol = this._options.nativeProtocols[protocol];
   if (!nativeProtocol) {
-    this.emit("error", new TypeError("Unsupported protocol " + protocol));
-    return;
+    throw new TypeError("Unsupported protocol " + protocol);
   }
 
   // If specified, use the agent corresponding to the protocol
@@ -26370,8 +26455,7 @@ RedirectableRequest.prototype._processResponse = function (response) {
   // RFC7231§6.4: A client SHOULD detect and intervene
   // in cyclical redirections (i.e., "infinite" redirection loops).
   if (++this._redirectCount > this._options.maxRedirects) {
-    this.emit("error", new TooManyRedirectsError());
-    return;
+    throw new TooManyRedirectsError();
   }
 
   // Store the request headers if applicable
@@ -26405,34 +26489,24 @@ RedirectableRequest.prototype._processResponse = function (response) {
   var currentHostHeader = removeMatchingHeaders(/^host$/i, this._options.headers);
 
   // If the redirect is relative, carry over the host of the last request
-  var currentUrlParts = url.parse(this._currentUrl);
+  var currentUrlParts = parseUrl(this._currentUrl);
   var currentHost = currentHostHeader || currentUrlParts.host;
   var currentUrl = /^\w+:/.test(location) ? this._currentUrl :
     url.format(Object.assign(currentUrlParts, { host: currentHost }));
 
-  // Determine the URL of the redirection
-  var redirectUrl;
-  try {
-    redirectUrl = url.resolve(currentUrl, location);
-  }
-  catch (cause) {
-    this.emit("error", new RedirectionError({ cause: cause }));
-    return;
-  }
-
   // Create the redirected request
-  debug("redirecting to", redirectUrl);
+  var redirectUrl = resolveUrl(location, currentUrl);
+  debug("redirecting to", redirectUrl.href);
   this._isRedirect = true;
-  var redirectUrlParts = url.parse(redirectUrl);
-  Object.assign(this._options, redirectUrlParts);
+  spreadUrlObject(redirectUrl, this._options);
 
   // Drop confidential headers when redirecting to a less secure protocol
   // or to a different domain that is not a superdomain
-  if (redirectUrlParts.protocol !== currentUrlParts.protocol &&
-     redirectUrlParts.protocol !== "https:" ||
-     redirectUrlParts.host !== currentHost &&
-     !isSubdomain(redirectUrlParts.host, currentHost)) {
-    removeMatchingHeaders(/^(?:authorization|cookie)$/i, this._options.headers);
+  if (redirectUrl.protocol !== currentUrlParts.protocol &&
+     redirectUrl.protocol !== "https:" ||
+     redirectUrl.host !== currentHost &&
+     !isSubdomain(redirectUrl.host, currentHost)) {
+    removeMatchingHeaders(/^(?:(?:proxy-)?authorization|cookie)$/i, this._options.headers);
   }
 
   // Evaluate the beforeRedirect callback
@@ -26446,23 +26520,12 @@ RedirectableRequest.prototype._processResponse = function (response) {
       method: method,
       headers: requestHeaders,
     };
-    try {
-      beforeRedirect(this._options, responseDetails, requestDetails);
-    }
-    catch (err) {
-      this.emit("error", err);
-      return;
-    }
+    beforeRedirect(this._options, responseDetails, requestDetails);
     this._sanitizeOptions(this._options);
   }
 
   // Perform the redirected request
-  try {
-    this._performRequest();
-  }
-  catch (cause) {
-    this.emit("error", new RedirectionError({ cause: cause }));
-  }
+  this._performRequest();
 };
 
 // Wraps the key/value object of protocols with redirect functionality
@@ -26482,27 +26545,16 @@ function wrap(protocols) {
 
     // Executes a request, following redirects
     function request(input, options, callback) {
-      // Parse parameters
-      if (isString(input)) {
-        var parsed;
-        try {
-          parsed = urlToOptions(new URL(input));
-        }
-        catch (err) {
-          /* istanbul ignore next */
-          parsed = url.parse(input);
-        }
-        if (!isString(parsed.protocol)) {
-          throw new InvalidUrlError({ input });
-        }
-        input = parsed;
+      // Parse parameters, ensuring that input is an object
+      if (isURL(input)) {
+        input = spreadUrlObject(input);
       }
-      else if (URL && (input instanceof URL)) {
-        input = urlToOptions(input);
+      else if (isString(input)) {
+        input = spreadUrlObject(parseUrl(input));
       }
       else {
         callback = options;
-        options = input;
+        options = validateUrl(input);
         input = { protocol: protocol };
       }
       if (isFunction(options)) {
@@ -26541,27 +26593,57 @@ function wrap(protocols) {
   return exports;
 }
 
-/* istanbul ignore next */
 function noop() { /* empty */ }
 
-// from https://github.com/nodejs/node/blob/master/lib/internal/url.js
-function urlToOptions(urlObject) {
-  var options = {
-    protocol: urlObject.protocol,
-    hostname: urlObject.hostname.startsWith("[") ?
-      /* istanbul ignore next */
-      urlObject.hostname.slice(1, -1) :
-      urlObject.hostname,
-    hash: urlObject.hash,
-    search: urlObject.search,
-    pathname: urlObject.pathname,
-    path: urlObject.pathname + urlObject.search,
-    href: urlObject.href,
-  };
-  if (urlObject.port !== "") {
-    options.port = Number(urlObject.port);
+function parseUrl(input) {
+  var parsed;
+  /* istanbul ignore else */
+  if (useNativeURL) {
+    parsed = new URL(input);
   }
-  return options;
+  else {
+    // Ensure the URL is valid and absolute
+    parsed = validateUrl(url.parse(input));
+    if (!isString(parsed.protocol)) {
+      throw new InvalidUrlError({ input });
+    }
+  }
+  return parsed;
+}
+
+function resolveUrl(relative, base) {
+  /* istanbul ignore next */
+  return useNativeURL ? new URL(relative, base) : parseUrl(url.resolve(base, relative));
+}
+
+function validateUrl(input) {
+  if (/^\[/.test(input.hostname) && !/^\[[:0-9a-f]+\]$/i.test(input.hostname)) {
+    throw new InvalidUrlError({ input: input.href || input });
+  }
+  if (/^\[/.test(input.host) && !/^\[[:0-9a-f]+\](:\d+)?$/i.test(input.host)) {
+    throw new InvalidUrlError({ input: input.href || input });
+  }
+  return input;
+}
+
+function spreadUrlObject(urlObject, target) {
+  var spread = target || {};
+  for (var key of preservedUrlFields) {
+    spread[key] = urlObject[key];
+  }
+
+  // Fix IPv6 hostname
+  if (spread.hostname.startsWith("[")) {
+    spread.hostname = spread.hostname.slice(1, -1);
+  }
+  // Ensure port is a number
+  if (spread.port !== "") {
+    spread.port = Number(spread.port);
+  }
+  // Concatenate path
+  spread.path = spread.search ? spread.pathname + spread.search : spread.pathname;
+
+  return spread;
 }
 
 function removeMatchingHeaders(regex, headers) {
@@ -26587,8 +26669,16 @@ function createErrorType(code, message, baseClass) {
 
   // Attach constructor and set default properties
   CustomError.prototype = new (baseClass || Error)();
-  CustomError.prototype.constructor = CustomError;
-  CustomError.prototype.name = "Error [" + code + "]";
+  Object.defineProperties(CustomError.prototype, {
+    constructor: {
+      value: CustomError,
+      enumerable: false,
+    },
+    name: {
+      value: "Error [" + code + "]",
+      enumerable: false,
+    },
+  });
   return CustomError;
 }
 
@@ -26616,6 +26706,10 @@ function isFunction(value) {
 
 function isBuffer(value) {
   return typeof value === "object" && ("length" in value);
+}
+
+function isURL(value) {
+  return URL && value instanceof URL;
 }
 
 // Exports
@@ -45138,10 +45232,10 @@ module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("zlib");
 /***/ 2640:
 /***/ ((module) => {
 
-function _arrayLikeToArray(arr, len) {
-  if (len == null || len > arr.length) len = arr.length;
-  for (var i = 0, arr2 = new Array(len); i < len; i++) arr2[i] = arr[i];
-  return arr2;
+function _arrayLikeToArray(r, a) {
+  (null == a || a > r.length) && (a = r.length);
+  for (var e = 0, n = Array(a); e < a; e++) n[e] = r[e];
+  return n;
 }
 module.exports = _arrayLikeToArray, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
@@ -45150,11 +45244,9 @@ module.exports = _arrayLikeToArray, module.exports.__esModule = true, module.exp
 /***/ 5492:
 /***/ ((module) => {
 
-function _assertThisInitialized(self) {
-  if (self === void 0) {
-    throw new ReferenceError("this hasn't been initialised - super() hasn't been called");
-  }
-  return self;
+function _assertThisInitialized(e) {
+  if (void 0 === e) throw new ReferenceError("this hasn't been initialised - super() hasn't been called");
+  return e;
 }
 module.exports = _assertThisInitialized, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
@@ -45163,10 +45255,8 @@ module.exports = _assertThisInitialized, module.exports.__esModule = true, modul
 /***/ 6383:
 /***/ ((module) => {
 
-function _classCallCheck(instance, Constructor) {
-  if (!(instance instanceof Constructor)) {
-    throw new TypeError("Cannot call a class as a function");
-  }
+function _classCallCheck(a, n) {
+  if (!(a instanceof n)) throw new TypeError("Cannot call a class as a function");
 }
 module.exports = _classCallCheck, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
@@ -45176,22 +45266,16 @@ module.exports = _classCallCheck, module.exports.__esModule = true, module.expor
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 var toPropertyKey = __nccwpck_require__(2319);
-function _defineProperties(target, props) {
-  for (var i = 0; i < props.length; i++) {
-    var descriptor = props[i];
-    descriptor.enumerable = descriptor.enumerable || false;
-    descriptor.configurable = true;
-    if ("value" in descriptor) descriptor.writable = true;
-    Object.defineProperty(target, toPropertyKey(descriptor.key), descriptor);
+function _defineProperties(e, r) {
+  for (var t = 0; t < r.length; t++) {
+    var o = r[t];
+    o.enumerable = o.enumerable || !1, o.configurable = !0, "value" in o && (o.writable = !0), Object.defineProperty(e, toPropertyKey(o.key), o);
   }
 }
-function _createClass(Constructor, protoProps, staticProps) {
-  if (protoProps) _defineProperties(Constructor.prototype, protoProps);
-  if (staticProps) _defineProperties(Constructor, staticProps);
-  Object.defineProperty(Constructor, "prototype", {
-    writable: false
-  });
-  return Constructor;
+function _createClass(e, r, t) {
+  return r && _defineProperties(e.prototype, r), t && _defineProperties(e, t), Object.defineProperty(e, "prototype", {
+    writable: !1
+  }), e;
 }
 module.exports = _createClass, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
@@ -45201,53 +45285,50 @@ module.exports = _createClass, module.exports.__esModule = true, module.exports[
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 var unsupportedIterableToArray = __nccwpck_require__(7361);
-function _createForOfIteratorHelper(o, allowArrayLike) {
-  var it = typeof Symbol !== "undefined" && o[Symbol.iterator] || o["@@iterator"];
-  if (!it) {
-    if (Array.isArray(o) || (it = unsupportedIterableToArray(o)) || allowArrayLike && o && typeof o.length === "number") {
-      if (it) o = it;
-      var i = 0;
-      var F = function F() {};
+function _createForOfIteratorHelper(r, e) {
+  var t = "undefined" != typeof Symbol && r[Symbol.iterator] || r["@@iterator"];
+  if (!t) {
+    if (Array.isArray(r) || (t = unsupportedIterableToArray(r)) || e && r && "number" == typeof r.length) {
+      t && (r = t);
+      var _n = 0,
+        F = function F() {};
       return {
         s: F,
         n: function n() {
-          if (i >= o.length) return {
-            done: true
-          };
-          return {
-            done: false,
-            value: o[i++]
+          return _n >= r.length ? {
+            done: !0
+          } : {
+            done: !1,
+            value: r[_n++]
           };
         },
-        e: function e(_e) {
-          throw _e;
+        e: function e(r) {
+          throw r;
         },
         f: F
       };
     }
     throw new TypeError("Invalid attempt to iterate non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method.");
   }
-  var normalCompletion = true,
-    didErr = false,
-    err;
+  var o,
+    a = !0,
+    u = !1;
   return {
     s: function s() {
-      it = it.call(o);
+      t = t.call(r);
     },
     n: function n() {
-      var step = it.next();
-      normalCompletion = step.done;
-      return step;
+      var r = t.next();
+      return a = r.done, r;
     },
-    e: function e(_e2) {
-      didErr = true;
-      err = _e2;
+    e: function e(r) {
+      u = !0, o = r;
     },
     f: function f() {
       try {
-        if (!normalCompletion && it["return"] != null) it["return"]();
+        a || null == t["return"] || t["return"]();
       } finally {
-        if (didErr) throw err;
+        if (u) throw o;
       }
     }
   };
@@ -45262,18 +45343,16 @@ module.exports = _createForOfIteratorHelper, module.exports.__esModule = true, m
 var getPrototypeOf = __nccwpck_require__(2369);
 var isNativeReflectConstruct = __nccwpck_require__(1735);
 var possibleConstructorReturn = __nccwpck_require__(6066);
-function _createSuper(Derived) {
-  var hasNativeReflectConstruct = isNativeReflectConstruct();
-  return function _createSuperInternal() {
-    var Super = getPrototypeOf(Derived),
-      result;
-    if (hasNativeReflectConstruct) {
-      var NewTarget = getPrototypeOf(this).constructor;
-      result = Reflect.construct(Super, arguments, NewTarget);
-    } else {
-      result = Super.apply(this, arguments);
-    }
-    return possibleConstructorReturn(this, result);
+function _createSuper(t) {
+  var r = isNativeReflectConstruct();
+  return function () {
+    var e,
+      o = getPrototypeOf(t);
+    if (r) {
+      var s = getPrototypeOf(this).constructor;
+      e = Reflect.construct(o, arguments, s);
+    } else e = o.apply(this, arguments);
+    return possibleConstructorReturn(this, e);
   };
 }
 module.exports = _createSuper, module.exports.__esModule = true, module.exports["default"] = module.exports;
@@ -45284,19 +45363,13 @@ module.exports = _createSuper, module.exports.__esModule = true, module.exports[
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 var toPropertyKey = __nccwpck_require__(2319);
-function _defineProperty(obj, key, value) {
-  key = toPropertyKey(key);
-  if (key in obj) {
-    Object.defineProperty(obj, key, {
-      value: value,
-      enumerable: true,
-      configurable: true,
-      writable: true
-    });
-  } else {
-    obj[key] = value;
-  }
-  return obj;
+function _defineProperty(e, r, t) {
+  return (r = toPropertyKey(r)) in e ? Object.defineProperty(e, r, {
+    value: t,
+    enumerable: !0,
+    configurable: !0,
+    writable: !0
+  }) : e[r] = t, e;
 }
 module.exports = _defineProperty, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
@@ -45305,11 +45378,10 @@ module.exports = _defineProperty, module.exports.__esModule = true, module.expor
 /***/ 2369:
 /***/ ((module) => {
 
-function _getPrototypeOf(o) {
-  module.exports = _getPrototypeOf = Object.setPrototypeOf ? Object.getPrototypeOf.bind() : function _getPrototypeOf(o) {
-    return o.__proto__ || Object.getPrototypeOf(o);
-  }, module.exports.__esModule = true, module.exports["default"] = module.exports;
-  return _getPrototypeOf(o);
+function _getPrototypeOf(t) {
+  return (module.exports = _getPrototypeOf = Object.setPrototypeOf ? Object.getPrototypeOf.bind() : function (t) {
+    return t.__proto__ || Object.getPrototypeOf(t);
+  }, module.exports.__esModule = true, module.exports["default"] = module.exports), _getPrototypeOf(t);
 }
 module.exports = _getPrototypeOf, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
@@ -45319,21 +45391,17 @@ module.exports = _getPrototypeOf, module.exports.__esModule = true, module.expor
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 var setPrototypeOf = __nccwpck_require__(9269);
-function _inherits(subClass, superClass) {
-  if (typeof superClass !== "function" && superClass !== null) {
-    throw new TypeError("Super expression must either be null or a function");
-  }
-  subClass.prototype = Object.create(superClass && superClass.prototype, {
+function _inherits(t, e) {
+  if ("function" != typeof e && null !== e) throw new TypeError("Super expression must either be null or a function");
+  t.prototype = Object.create(e && e.prototype, {
     constructor: {
-      value: subClass,
-      writable: true,
-      configurable: true
+      value: t,
+      writable: !0,
+      configurable: !0
     }
-  });
-  Object.defineProperty(subClass, "prototype", {
-    writable: false
-  });
-  if (superClass) setPrototypeOf(subClass, superClass);
+  }), Object.defineProperty(t, "prototype", {
+    writable: !1
+  }), e && setPrototypeOf(t, e);
 }
 module.exports = _inherits, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
@@ -45342,9 +45410,9 @@ module.exports = _inherits, module.exports.__esModule = true, module.exports["de
 /***/ 3286:
 /***/ ((module) => {
 
-function _interopRequireDefault(obj) {
-  return obj && obj.__esModule ? obj : {
-    "default": obj
+function _interopRequireDefault(e) {
+  return e && e.__esModule ? e : {
+    "default": e
   };
 }
 module.exports = _interopRequireDefault, module.exports.__esModule = true, module.exports["default"] = module.exports;
@@ -45355,15 +45423,12 @@ module.exports = _interopRequireDefault, module.exports.__esModule = true, modul
 /***/ ((module) => {
 
 function _isNativeReflectConstruct() {
-  if (typeof Reflect === "undefined" || !Reflect.construct) return false;
-  if (Reflect.construct.sham) return false;
-  if (typeof Proxy === "function") return true;
   try {
-    Boolean.prototype.valueOf.call(Reflect.construct(Boolean, [], function () {}));
-    return true;
-  } catch (e) {
-    return false;
-  }
+    var t = !Boolean.prototype.valueOf.call(Reflect.construct(Boolean, [], function () {}));
+  } catch (t) {}
+  return (module.exports = _isNativeReflectConstruct = function _isNativeReflectConstruct() {
+    return !!t;
+  }, module.exports.__esModule = true, module.exports["default"] = module.exports)();
 }
 module.exports = _isNativeReflectConstruct, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
@@ -45374,13 +45439,10 @@ module.exports = _isNativeReflectConstruct, module.exports.__esModule = true, mo
 
 var _typeof = (__nccwpck_require__(5605)["default"]);
 var assertThisInitialized = __nccwpck_require__(5492);
-function _possibleConstructorReturn(self, call) {
-  if (call && (_typeof(call) === "object" || typeof call === "function")) {
-    return call;
-  } else if (call !== void 0) {
-    throw new TypeError("Derived constructors may only return object or undefined");
-  }
-  return assertThisInitialized(self);
+function _possibleConstructorReturn(t, e) {
+  if (e && ("object" == _typeof(e) || "function" == typeof e)) return e;
+  if (void 0 !== e) throw new TypeError("Derived constructors may only return object or undefined");
+  return assertThisInitialized(t);
 }
 module.exports = _possibleConstructorReturn, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
@@ -45389,12 +45451,10 @@ module.exports = _possibleConstructorReturn, module.exports.__esModule = true, m
 /***/ 9269:
 /***/ ((module) => {
 
-function _setPrototypeOf(o, p) {
-  module.exports = _setPrototypeOf = Object.setPrototypeOf ? Object.setPrototypeOf.bind() : function _setPrototypeOf(o, p) {
-    o.__proto__ = p;
-    return o;
-  }, module.exports.__esModule = true, module.exports["default"] = module.exports;
-  return _setPrototypeOf(o, p);
+function _setPrototypeOf(t, e) {
+  return (module.exports = _setPrototypeOf = Object.setPrototypeOf ? Object.setPrototypeOf.bind() : function (t, e) {
+    return t.__proto__ = e, t;
+  }, module.exports.__esModule = true, module.exports["default"] = module.exports), _setPrototypeOf(t, e);
 }
 module.exports = _setPrototypeOf, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
@@ -45404,17 +45464,17 @@ module.exports = _setPrototypeOf, module.exports.__esModule = true, module.expor
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 var _typeof = (__nccwpck_require__(5605)["default"]);
-function _toPrimitive(input, hint) {
-  if (_typeof(input) !== "object" || input === null) return input;
-  var prim = input[Symbol.toPrimitive];
-  if (prim !== undefined) {
-    var res = prim.call(input, hint || "default");
-    if (_typeof(res) !== "object") return res;
+function toPrimitive(t, r) {
+  if ("object" != _typeof(t) || !t) return t;
+  var e = t[Symbol.toPrimitive];
+  if (void 0 !== e) {
+    var i = e.call(t, r || "default");
+    if ("object" != _typeof(i)) return i;
     throw new TypeError("@@toPrimitive must return a primitive value.");
   }
-  return (hint === "string" ? String : Number)(input);
+  return ("string" === r ? String : Number)(t);
 }
-module.exports = _toPrimitive, module.exports.__esModule = true, module.exports["default"] = module.exports;
+module.exports = toPrimitive, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
 /***/ }),
 
@@ -45423,11 +45483,11 @@ module.exports = _toPrimitive, module.exports.__esModule = true, module.exports[
 
 var _typeof = (__nccwpck_require__(5605)["default"]);
 var toPrimitive = __nccwpck_require__(7655);
-function _toPropertyKey(arg) {
-  var key = toPrimitive(arg, "string");
-  return _typeof(key) === "symbol" ? key : String(key);
+function toPropertyKey(t) {
+  var i = toPrimitive(t, "string");
+  return "symbol" == _typeof(i) ? i : i + "";
 }
-module.exports = _toPropertyKey, module.exports.__esModule = true, module.exports["default"] = module.exports;
+module.exports = toPropertyKey, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
 /***/ }),
 
@@ -45451,13 +45511,12 @@ module.exports = _typeof, module.exports.__esModule = true, module.exports["defa
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 var arrayLikeToArray = __nccwpck_require__(2640);
-function _unsupportedIterableToArray(o, minLen) {
-  if (!o) return;
-  if (typeof o === "string") return arrayLikeToArray(o, minLen);
-  var n = Object.prototype.toString.call(o).slice(8, -1);
-  if (n === "Object" && o.constructor) n = o.constructor.name;
-  if (n === "Map" || n === "Set") return Array.from(o);
-  if (n === "Arguments" || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(n)) return arrayLikeToArray(o, minLen);
+function _unsupportedIterableToArray(r, a) {
+  if (r) {
+    if ("string" == typeof r) return arrayLikeToArray(r, a);
+    var t = {}.toString.call(r).slice(8, -1);
+    return "Object" === t && r.constructor && (t = r.constructor.name), "Map" === t || "Set" === t ? Array.from(r) : "Arguments" === t || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(t) ? arrayLikeToArray(r, a) : void 0;
+  }
 }
 module.exports = _unsupportedIterableToArray, module.exports.__esModule = true, module.exports["default"] = module.exports;
 
@@ -48808,7 +48867,7 @@ exports.suggestSimilar = suggestSimilar;
 /***/ 9968:
 /***/ ((module) => {
 
-module.exports = JSON.parse('{"name":"dotenv","version":"16.3.1","description":"Loads environment variables from .env file","main":"lib/main.js","types":"lib/main.d.ts","exports":{".":{"types":"./lib/main.d.ts","require":"./lib/main.js","default":"./lib/main.js"},"./config":"./config.js","./config.js":"./config.js","./lib/env-options":"./lib/env-options.js","./lib/env-options.js":"./lib/env-options.js","./lib/cli-options":"./lib/cli-options.js","./lib/cli-options.js":"./lib/cli-options.js","./package.json":"./package.json"},"scripts":{"dts-check":"tsc --project tests/types/tsconfig.json","lint":"standard","lint-readme":"standard-markdown","pretest":"npm run lint && npm run dts-check","test":"tap tests/*.js --100 -Rspec","prerelease":"npm test","release":"standard-version"},"repository":{"type":"git","url":"git://github.com/motdotla/dotenv.git"},"funding":"https://github.com/motdotla/dotenv?sponsor=1","keywords":["dotenv","env",".env","environment","variables","config","settings"],"readmeFilename":"README.md","license":"BSD-2-Clause","devDependencies":{"@definitelytyped/dtslint":"^0.0.133","@types/node":"^18.11.3","decache":"^4.6.1","sinon":"^14.0.1","standard":"^17.0.0","standard-markdown":"^7.1.0","standard-version":"^9.5.0","tap":"^16.3.0","tar":"^6.1.11","typescript":"^4.8.4"},"engines":{"node":">=12"},"browser":{"fs":false}}');
+module.exports = JSON.parse('{"name":"dotenv","version":"16.4.5","description":"Loads environment variables from .env file","main":"lib/main.js","types":"lib/main.d.ts","exports":{".":{"types":"./lib/main.d.ts","require":"./lib/main.js","default":"./lib/main.js"},"./config":"./config.js","./config.js":"./config.js","./lib/env-options":"./lib/env-options.js","./lib/env-options.js":"./lib/env-options.js","./lib/cli-options":"./lib/cli-options.js","./lib/cli-options.js":"./lib/cli-options.js","./package.json":"./package.json"},"scripts":{"dts-check":"tsc --project tests/types/tsconfig.json","lint":"standard","lint-readme":"standard-markdown","pretest":"npm run lint && npm run dts-check","test":"tap tests/*.js --100 -Rspec","test:coverage":"tap --coverage-report=lcov","prerelease":"npm test","release":"standard-version"},"repository":{"type":"git","url":"git://github.com/motdotla/dotenv.git"},"funding":"https://dotenvx.com","keywords":["dotenv","env",".env","environment","variables","config","settings"],"readmeFilename":"README.md","license":"BSD-2-Clause","devDependencies":{"@definitelytyped/dtslint":"^0.0.133","@types/node":"^18.11.3","decache":"^4.6.1","sinon":"^14.0.1","standard":"^17.0.0","standard-markdown":"^7.1.0","standard-version":"^9.5.0","tap":"^16.3.0","tar":"^6.1.11","typescript":"^4.8.4"},"engines":{"node":">=12"},"browser":{"fs":false}}');
 
 /***/ }),
 
@@ -48884,6 +48943,17 @@ module.exports = JSON.parse('{"application/1d-interleaved-parityfec":{"source":"
 /******/ 	__nccwpck_require__.o = (obj, prop) => (Object.prototype.hasOwnProperty.call(obj, prop))
 /******/ })();
 /******/ 
+/******/ /* webpack/runtime/make namespace object */
+/******/ (() => {
+/******/ 	// define __esModule on exports
+/******/ 	__nccwpck_require__.r = (exports) => {
+/******/ 		if(typeof Symbol !== 'undefined' && Symbol.toStringTag) {
+/******/ 			Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
+/******/ 		}
+/******/ 		Object.defineProperty(exports, '__esModule', { value: true });
+/******/ 	};
+/******/ })();
+/******/ 
 /******/ /* webpack/runtime/node module decorator */
 /******/ (() => {
 /******/ 	__nccwpck_require__.nmd = (module) => {
@@ -48901,6 +48971,16 @@ module.exports = JSON.parse('{"application/1d-interleaved-parityfec":{"source":"
 var __webpack_exports__ = {};
 // This entry need to be wrapped in an IIFE because it need to be isolated against other modules in the chunk.
 (() => {
+
+// NAMESPACE OBJECT: ./node_modules/axios/lib/platform/common/utils.js
+var common_utils_namespaceObject = {};
+__nccwpck_require__.r(common_utils_namespaceObject);
+__nccwpck_require__.d(common_utils_namespaceObject, {
+  "hasBrowserEnv": () => (hasBrowserEnv),
+  "hasStandardBrowserEnv": () => (hasStandardBrowserEnv),
+  "hasStandardBrowserWebWorkerEnv": () => (hasStandardBrowserWebWorkerEnv),
+  "origin": () => (origin)
+});
 
 // EXTERNAL MODULE: ./node_modules/dotenv/lib/main.js
 var main = __nccwpck_require__(2437);
@@ -49012,7 +49092,7 @@ function partsOffset(dtf, date) {
 }
 
 function hackyOffset(dtf, date) {
-  var formatted = dtf.format(date).replace(/\u200E/g, '')
+  var formatted = dtf.format(date)
   var parsed = /(\d+)\/(\d+)\/(\d+),? (\d+):(\d+):(\d+)/.exec(formatted)
   // var [, fMonth, fDay, fYear, fHour, fMinute, fSecond] = parsed
   // return [fYear, fMonth, fDay, fHour, fMinute, fSecond]
@@ -49027,10 +49107,10 @@ function getDateTimeFormat(timeZone) {
   if (!dtfCache[timeZone]) {
     // New browsers use `hourCycle`, IE and Chrome <73 does not support it and uses `hour12`
     var testDateFormatted = new Intl.DateTimeFormat('en-US', {
-      hour12: false,
+      hourCycle: 'h23',
       timeZone: 'America/New_York',
       year: 'numeric',
-      month: 'numeric',
+      month: '2-digit',
       day: '2-digit',
       hour: '2-digit',
       minute: '2-digit',
@@ -49042,7 +49122,7 @@ function getDateTimeFormat(timeZone) {
 
     dtfCache[timeZone] = hourCycleSupported
       ? new Intl.DateTimeFormat('en-US', {
-          hour12: false,
+          hourCycle: 'h23',
           timeZone: timeZone,
           year: 'numeric',
           month: 'numeric',
@@ -49052,7 +49132,7 @@ function getDateTimeFormat(timeZone) {
           second: '2-digit',
         })
       : new Intl.DateTimeFormat('en-US', {
-          hourCycle: 'h23',
+          hour12: false,
           timeZone: timeZone,
           year: 'numeric',
           month: 'numeric',
@@ -49091,7 +49171,7 @@ var patterns = {
   timezone: /([Z+-].*)$/,
   timezoneZ: /^(Z)$/,
   timezoneHH: /^([+-]\d{2})$/,
-  timezoneHHMM: /^([+-]\d{2}):?(\d{2})$/,
+  timezoneHHMM: /^([+-])(\d{2}):?(\d{2})$/,
 }
 
 // Parse various time zone offset formats to an offset in milliseconds
@@ -49127,15 +49207,15 @@ function tzParseTimezone(timezoneString, date, isUtcDate) {
   // ±hh:mm or ±hhmm
   token = patterns.timezoneHHMM.exec(timezoneString)
   if (token) {
-    hours = parseInt(token[1], 10)
-    var minutes = parseInt(token[2], 10)
+    hours = parseInt(token[2], 10)
+    var minutes = parseInt(token[3], 10)
 
     if (!validateTimezone(hours, minutes)) {
       return NaN
     }
 
     absoluteOffset = Math.abs(hours) * MILLISECONDS_IN_HOUR + minutes * MILLISECONDS_IN_MINUTE
-    return hours > 0 ? -absoluteOffset : absoluteOffset
+    return token[1] === '+' ? -absoluteOffset : absoluteOffset
   }
 
   // IANA time zone
@@ -49237,7 +49317,7 @@ var formatters_MILLISECONDS_IN_MINUTE = 60 * 1000
 var formatters = {
   // Timezone (ISO-8601. If offset is 0, output is always `'Z'`)
   X: function (date, token, localize, options) {
-    var timezoneOffset = getTimeZoneOffset(options.timeZone, options._originalDate || date)
+    var timezoneOffset = getTimeZoneOffset(options.timeZone, date)
 
     if (timezoneOffset === 0) {
       return 'Z'
@@ -49267,7 +49347,7 @@ var formatters = {
 
   // Timezone (ISO-8601. If offset is 0, output is `'+00:00'` or equivalent)
   x: function (date, token, localize, options) {
-    var timezoneOffset = getTimeZoneOffset(options.timeZone, options._originalDate || date)
+    var timezoneOffset = getTimeZoneOffset(options.timeZone, date)
 
     switch (token) {
       // Hours and optional minutes
@@ -49293,7 +49373,7 @@ var formatters = {
 
   // Timezone (GMT)
   O: function (date, token, localize, options) {
-    var timezoneOffset = getTimeZoneOffset(options.timeZone, options._originalDate || date)
+    var timezoneOffset = getTimeZoneOffset(options.timeZone, date)
 
     switch (token) {
       // Short
@@ -49310,18 +49390,16 @@ var formatters = {
 
   // Timezone (specific non-location)
   z: function (date, token, localize, options) {
-    var originalDate = options._originalDate || date
-
     switch (token) {
       // Short
       case 'z':
       case 'zz':
       case 'zzz':
-        return tzIntlTimeZoneName('short', originalDate, options)
+        return tzIntlTimeZoneName('short', date, options)
       // Long
       case 'zzzz':
       default:
-        return tzIntlTimeZoneName('long', originalDate, options)
+        return tzIntlTimeZoneName('long', date, options)
     }
   },
 }
@@ -49362,7 +49440,7 @@ function formatTimezoneWithOptionalMinutes(offset, dirtyDelimeter) {
   return formatTimezone(offset, dirtyDelimeter)
 }
 
-function formatTimezoneShort(offset, dirtyDelimeter) {
+function formatTimezoneShort(offset, dirtyDelimiter) {
   var sign = offset > 0 ? '-' : '+'
   var absOffset = Math.abs(offset)
   var hours = Math.floor(absOffset / 60)
@@ -49370,8 +49448,8 @@ function formatTimezoneShort(offset, dirtyDelimeter) {
   if (minutes === 0) {
     return sign + String(hours)
   }
-  var delimeter = dirtyDelimeter || ''
-  return sign + String(hours) + delimeter + addLeadingZeros(minutes, 2)
+  var delimiter = dirtyDelimiter || ''
+  return sign + String(hours) + delimiter + addLeadingZeros(minutes, 2)
 }
 
 /* harmony default export */ const format_formatters = (formatters);
@@ -50129,6 +50207,8 @@ var tzFormattingTokensRegExp = /([xXOz]+)|''|'(''|[^'])+('|$)/g
  *   - Some of the local week-numbering year tokens (`YY`, `YYYY`) that are confused with the calendar year tokens
  *   (`yy`, `yyyy`). See: https://git.io/fxCyr
  * @param {String} [options.timeZone=''] - used to specify the IANA time zone offset of a date String.
+ * @param {Date|Number} [options.originalDate] - can be used to pass the original unmodified date to `format` to
+ *   improve correctness of the replaced timezone token close to the DST threshold.
  * @returns {String} the formatted date string
  * @throws {TypeError} 2 arguments required
  * @throws {RangeError} `options.additionalDigits` must be 0, 1 or 2
@@ -50163,7 +50243,7 @@ function format_format(dirtyDate, dirtyFormatStr, dirtyOptions) {
 
   var matches = formatStr.match(tzFormattingTokensRegExp)
   if (matches) {
-    var date = toDate(dirtyDate, options)
+    var date = toDate(options.originalDate || dirtyDate, options)
     // Work through each match and replace the tz token in the format string with the quoted
     // formatted time zone so the remaining tokens can be filled in by date-fns#format.
     formatStr = matches.reduce(function (result, token) {
@@ -50261,6 +50341,7 @@ function utcToZonedTime(dirtyDate, timeZone, options) {
 function formatInTimeZone(date, timeZone, formatStr, options) {
   var extendedOptions = cloneObject(options)
   extendedOptions.timeZone = timeZone
+  extendedOptions.originalDate = date
   return format_format(utcToZonedTime(date, timeZone), formatStr, extendedOptions)
 }
 
@@ -50667,6 +50748,8 @@ var src = __nccwpck_require__(8237);
 var external_child_process_ = __nccwpck_require__(2081);
 // EXTERNAL MODULE: ./node_modules/@kwsites/promise-deferred/dist/index.js
 var promise_deferred_dist = __nccwpck_require__(9819);
+;// CONCATENATED MODULE: external "node:events"
+const external_node_events_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:events");
 ;// CONCATENATED MODULE: ./node_modules/simple-git/dist/esm/index.js
 var __defProp = Object.defineProperty;
 var __defProps = Object.defineProperties;
@@ -50689,7 +50772,6 @@ var __spreadValues = (a, b) => {
   return a;
 };
 var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
-var __markAsModule = (target) => __defProp(target, "__esModule", { value: true });
 var __esm = (fn, res) => function __init() {
   return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
 };
@@ -50700,19 +50782,15 @@ var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, { get: all[name], enumerable: true });
 };
-var __reExport = (target, module, copyDefault, desc) => {
-  if (module && typeof module === "object" || typeof module === "function") {
-    for (let key of __getOwnPropNames(module))
-      if (!__hasOwnProp.call(target, key) && (copyDefault || key !== "default"))
-        __defProp(target, key, { get: () => module[key], enumerable: !(desc = __getOwnPropDesc(module, key)) || desc.enumerable });
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
   }
-  return target;
+  return to;
 };
-var __toCommonJS = /* @__PURE__ */ ((cache2) => {
-  return (module, temp) => {
-    return cache2 && cache2.get(module) || (temp = __reExport(__markAsModule({}), module, 1), cache2 && cache2.set(module, temp), temp);
-  };
-})(typeof WeakMap !== "undefined" ? /* @__PURE__ */ new WeakMap() : 0);
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 var __async = (__this, __arguments, generator) => {
   return new Promise((resolve, reject) => {
     var fulfilled = (value) => {
@@ -50749,6 +50827,7 @@ function toPaths(pathSpec) {
 var cache;
 var init_pathspec = __esm({
   "src/lib/args/pathspec.ts"() {
+    "use strict";
     cache = /* @__PURE__ */ new WeakMap();
   }
 });
@@ -50757,6 +50836,7 @@ var init_pathspec = __esm({
 var GitError;
 var init_git_error = __esm({
   "src/lib/errors/git-error.ts"() {
+    "use strict";
     GitError = class extends Error {
       constructor(task, message) {
         super(message);
@@ -50771,6 +50851,7 @@ var init_git_error = __esm({
 var GitResponseError;
 var init_git_response_error = __esm({
   "src/lib/errors/git-response-error.ts"() {
+    "use strict";
     init_git_error();
     GitResponseError = class extends GitError {
       constructor(git, message) {
@@ -50785,6 +50866,7 @@ var init_git_response_error = __esm({
 var TaskConfigurationError;
 var init_task_configuration_error = __esm({
   "src/lib/errors/task-configuration-error.ts"() {
+    "use strict";
     init_git_error();
     TaskConfigurationError = class extends GitError {
       constructor(message) {
@@ -50886,14 +50968,24 @@ function bufferToString(input) {
   return (Array.isArray(input) ? Buffer.concat(input) : input).toString("utf-8");
 }
 function pick(source, properties) {
-  return Object.assign({}, ...properties.map((property) => property in source ? { [property]: source[property] } : {}));
+  return Object.assign(
+    {},
+    ...properties.map((property) => property in source ? { [property]: source[property] } : {})
+  );
 }
 function delay(duration = 0) {
   return new Promise((done) => setTimeout(done, duration));
 }
+function orVoid(input) {
+  if (input === false) {
+    return void 0;
+  }
+  return input;
+}
 var NULL, NOOP, objectToString;
 var init_util = __esm({
   "src/lib/utils/util.ts"() {
+    "use strict";
     NULL = "\0";
     NOOP = () => {
     };
@@ -50921,6 +51013,7 @@ function filterFunction(input) {
 var filterArray, filterString, filterStringArray, filterStringOrStringArray, filterHasLength;
 var init_argument_filters = __esm({
   "src/lib/utils/argument-filters.ts"() {
+    "use strict";
     init_util();
     init_pathspec();
     filterArray = (input) => {
@@ -50948,6 +51041,7 @@ var init_argument_filters = __esm({
 var ExitCodes;
 var init_exit_codes = __esm({
   "src/lib/utils/exit-codes.ts"() {
+    "use strict";
     ExitCodes = /* @__PURE__ */ ((ExitCodes2) => {
       ExitCodes2[ExitCodes2["SUCCESS"] = 0] = "SUCCESS";
       ExitCodes2[ExitCodes2["ERROR"] = 1] = "ERROR";
@@ -50962,6 +51056,7 @@ var init_exit_codes = __esm({
 var GitOutputStreams;
 var init_git_output_streams = __esm({
   "src/lib/utils/git-output-streams.ts"() {
+    "use strict";
     GitOutputStreams = class {
       constructor(stdOut, stdErr) {
         this.stdOut = stdOut;
@@ -50978,6 +51073,7 @@ var init_git_output_streams = __esm({
 var LineParser, RemoteLineParser;
 var init_line_parser = __esm({
   "src/lib/utils/line-parser.ts"() {
+    "use strict";
     LineParser = class {
       constructor(regExp, useMatches) {
         this.matches = [];
@@ -51029,7 +51125,10 @@ var init_line_parser = __esm({
 // src/lib/utils/simple-git-options.ts
 function createInstanceConfig(...options) {
   const baseDir = process.cwd();
-  const config = Object.assign(__spreadValues({ baseDir }, defaultOptions), ...options.filter((o) => typeof o === "object" && o));
+  const config = Object.assign(
+    __spreadValues({ baseDir }, defaultOptions),
+    ...options.filter((o) => typeof o === "object" && o)
+  );
   config.baseDir = config.baseDir || baseDir;
   config.trimmed = config.trimmed === true;
   return config;
@@ -51037,6 +51136,7 @@ function createInstanceConfig(...options) {
 var defaultOptions;
 var init_simple_git_options = __esm({
   "src/lib/utils/simple-git-options.ts"() {
+    "use strict";
     defaultOptions = {
       binary: "git",
       maxConcurrentProcesses: 5,
@@ -51090,6 +51190,7 @@ function trailingFunctionArgument(args, includeNoop = true) {
 }
 var init_task_options = __esm({
   "src/lib/utils/task-options.ts"() {
+    "use strict";
     init_argument_filters();
     init_util();
     init_pathspec();
@@ -51116,6 +51217,7 @@ function parseStringResponse(result, parsers12, texts, trim = true) {
 }
 var init_task_parser = __esm({
   "src/lib/utils/task-parser.ts"() {
+    "use strict";
     init_util();
   }
 });
@@ -51156,6 +51258,7 @@ __export(utils_exports, {
   isUserFunction: () => isUserFunction,
   last: () => last,
   objectToString: () => objectToString,
+  orVoid: () => orVoid,
   parseStringResponse: () => parseStringResponse,
   pick: () => pick,
   prefixedArray: () => prefixedArray,
@@ -51167,6 +51270,7 @@ __export(utils_exports, {
 });
 var init_utils = __esm({
   "src/lib/utils/index.ts"() {
+    "use strict";
     init_argument_filters();
     init_exit_codes();
     init_git_output_streams();
@@ -51227,6 +51331,7 @@ function isNotRepoMessage(error) {
 var CheckRepoActions, onError, parser;
 var init_check_is_repo = __esm({
   "src/lib/tasks/check-is-repo.ts"() {
+    "use strict";
     init_utils();
     CheckRepoActions = /* @__PURE__ */ ((CheckRepoActions2) => {
       CheckRepoActions2["BARE"] = "bare";
@@ -51260,6 +51365,7 @@ function cleanSummaryParser(dryRun, text) {
 var CleanResponse, removalRegexp, dryRunRemovalRegexp, isFolderRegexp;
 var init_CleanSummary = __esm({
   "src/lib/responses/CleanSummary.ts"() {
+    "use strict";
     init_utils();
     CleanResponse = class {
       constructor(dryRun) {
@@ -51329,6 +51435,7 @@ function isEmptyTask(task) {
 var EMPTY_COMMANDS;
 var init_task = __esm({
   "src/lib/tasks/task.ts"() {
+    "use strict";
     init_task_configuration_error();
     EMPTY_COMMANDS = [];
   }
@@ -51405,6 +51512,7 @@ function isInteractiveMode(option) {
 var CONFIG_ERROR_INTERACTIVE_MODE, CONFIG_ERROR_MODE_REQUIRED, CONFIG_ERROR_UNKNOWN_OPTION, CleanOptions, CleanOptionValues;
 var init_clean = __esm({
   "src/lib/tasks/clean.ts"() {
+    "use strict";
     init_CleanSummary();
     init_utils();
     init_task();
@@ -51478,6 +51586,7 @@ function* configParser(text, requestedKey = null) {
 var ConfigList;
 var init_ConfigList = __esm({
   "src/lib/responses/ConfigList.ts"() {
+    "use strict";
     init_utils();
     ConfigList = class {
       constructor() {
@@ -51565,19 +51674,34 @@ function listConfigTask(scope) {
 function config_default() {
   return {
     addConfig(key, value, ...rest) {
-      return this._runTask(addConfigTask(key, value, rest[0] === true, asConfigScope(rest[1], "local" /* local */)), trailingFunctionArgument(arguments));
+      return this._runTask(
+        addConfigTask(
+          key,
+          value,
+          rest[0] === true,
+          asConfigScope(rest[1], "local" /* local */)
+        ),
+        trailingFunctionArgument(arguments)
+      );
     },
     getConfig(key, scope) {
-      return this._runTask(getConfigTask(key, asConfigScope(scope, void 0)), trailingFunctionArgument(arguments));
+      return this._runTask(
+        getConfigTask(key, asConfigScope(scope, void 0)),
+        trailingFunctionArgument(arguments)
+      );
     },
     listConfig(...rest) {
-      return this._runTask(listConfigTask(asConfigScope(rest[0], void 0)), trailingFunctionArgument(arguments));
+      return this._runTask(
+        listConfigTask(asConfigScope(rest[0], void 0)),
+        trailingFunctionArgument(arguments)
+      );
     }
   };
 }
 var GitConfigScope;
 var init_config = __esm({
   "src/lib/tasks/config.ts"() {
+    "use strict";
     init_ConfigList();
     init_utils();
     GitConfigScope = /* @__PURE__ */ ((GitConfigScope2) => {
@@ -51587,6 +51711,30 @@ var init_config = __esm({
       GitConfigScope2["worktree"] = "worktree";
       return GitConfigScope2;
     })(GitConfigScope || {});
+  }
+});
+
+// src/lib/tasks/diff-name-status.ts
+function isDiffNameStatus(input) {
+  return diffNameStatus.has(input);
+}
+var DiffNameStatus, diffNameStatus;
+var init_diff_name_status = __esm({
+  "src/lib/tasks/diff-name-status.ts"() {
+    "use strict";
+    DiffNameStatus = /* @__PURE__ */ ((DiffNameStatus2) => {
+      DiffNameStatus2["ADDED"] = "A";
+      DiffNameStatus2["COPIED"] = "C";
+      DiffNameStatus2["DELETED"] = "D";
+      DiffNameStatus2["MODIFIED"] = "M";
+      DiffNameStatus2["RENAMED"] = "R";
+      DiffNameStatus2["CHANGED"] = "T";
+      DiffNameStatus2["UNMERGED"] = "U";
+      DiffNameStatus2["UNKNOWN"] = "X";
+      DiffNameStatus2["BROKEN"] = "B";
+      return DiffNameStatus2;
+    })(DiffNameStatus || {});
+    diffNameStatus = new Set(Object.values(DiffNameStatus));
   }
 });
 
@@ -51618,26 +51766,33 @@ function grep_default() {
       const options = getTrailingOptions(arguments);
       for (const option of disallowedOptions) {
         if (options.includes(option)) {
-          return this._runTask(configurationErrorTask(`git.grep: use of "${option}" is not supported.`), then);
+          return this._runTask(
+            configurationErrorTask(`git.grep: use of "${option}" is not supported.`),
+            then
+          );
         }
       }
       if (typeof searchTerm === "string") {
         searchTerm = grepQueryBuilder().param(searchTerm);
       }
       const commands = ["grep", "--null", "-n", "--full-name", ...options, ...searchTerm];
-      return this._runTask({
-        commands,
-        format: "utf-8",
-        parser(stdOut) {
-          return parseGrep(stdOut);
-        }
-      }, then);
+      return this._runTask(
+        {
+          commands,
+          format: "utf-8",
+          parser(stdOut) {
+            return parseGrep(stdOut);
+          }
+        },
+        then
+      );
     }
   };
 }
 var disallowedOptions, Query, _a, GrepQuery;
 var init_grep = __esm({
   "src/lib/tasks/grep.ts"() {
+    "use strict";
     init_utils();
     init_task();
     disallowedOptions = ["-h"];
@@ -51695,6 +51850,7 @@ function isValidResetMode(mode) {
 var ResetMode, ResetModes;
 var init_reset = __esm({
   "src/lib/tasks/reset.ts"() {
+    "use strict";
     init_task();
     ResetMode = /* @__PURE__ */ ((ResetMode2) => {
       ResetMode2["MIXED"] = "mixed";
@@ -51744,7 +51900,10 @@ function createLogger(label, verbose, initialStep, infoDebugger = createLog()) {
   const key = childLoggerName(filterType(verbose, filterString), debugDebugger, infoDebugger);
   return step(initialStep);
   function sibling(name, initial) {
-    return append(spawned, createLogger(label, key.replace(/^[^:]+/, name), initial, infoDebugger));
+    return append(
+      spawned,
+      createLogger(label, key.replace(/^[^:]+/, name), initial, infoDebugger)
+    );
   }
   function step(phase) {
     const stepPrefix = phase && `[${phase}]` || "";
@@ -51760,6 +51919,7 @@ function createLogger(label, verbose, initialStep, infoDebugger = createLog()) {
 }
 var init_git_logger = __esm({
   "src/lib/git-logger.ts"() {
+    "use strict";
     init_utils();
     src.formatters.L = (value) => String(filterHasLength(value) ? value.length : "-");
     src.formatters.B = (value) => {
@@ -51775,6 +51935,7 @@ var init_git_logger = __esm({
 var _TasksPendingQueue, TasksPendingQueue;
 var init_tasks_pending_queue = __esm({
   "src/lib/runners/tasks-pending-queue.ts"() {
+    "use strict";
     init_git_error();
     init_git_logger();
     _TasksPendingQueue = class {
@@ -51804,9 +51965,14 @@ var init_tasks_pending_queue = __esm({
         for (const [task, { logger }] of Array.from(this._queue.entries())) {
           if (task === err.task) {
             logger.info(`Failed %o`, err);
-            logger(`Fatal exception, any as-yet un-started tasks run through this executor will not be attempted`);
+            logger(
+              `Fatal exception, any as-yet un-started tasks run through this executor will not be attempted`
+            );
           } else {
-            logger.info(`A fatal exception occurred in a previous task, the queue has been purged: %o`, err.message);
+            logger.info(
+              `A fatal exception occurred in a previous task, the queue has been purged: %o`,
+              err.message
+            );
           }
           this.complete(task);
         }
@@ -51861,6 +52027,7 @@ function onDataReceived(target, name, logger, output) {
 var GitExecutorChain;
 var init_git_executor_chain = __esm({
   "src/lib/runners/git-executor-chain.ts"() {
+    "use strict";
     init_git_error();
     init_task();
     init_utils();
@@ -51872,9 +52039,6 @@ var init_git_executor_chain = __esm({
         this._plugins = _plugins;
         this._chain = Promise.resolve();
         this._queue = new TasksPendingQueue();
-      }
-      get binary() {
-        return this._executor.binary;
       }
       get cwd() {
         return this._cwd || this._executor.cwd;
@@ -51918,8 +52082,19 @@ var init_git_executor_chain = __esm({
       }
       attemptRemoteTask(task, logger) {
         return __async(this, null, function* () {
-          const args = this._plugins.exec("spawn.args", [...task.commands], pluginContext(task, task.commands));
-          const raw = yield this.gitResponse(task, this.binary, args, this.outputHandler, logger.step("SPAWN"));
+          const binary = this._plugins.exec("spawn.binary", "", pluginContext(task, task.commands));
+          const args = this._plugins.exec(
+            "spawn.args",
+            [...task.commands],
+            pluginContext(task, task.commands)
+          );
+          const raw = yield this.gitResponse(
+            task,
+            binary,
+            args,
+            this.outputHandler,
+            logger.step("SPAWN")
+          );
           const outputStreams = yield this.handleTaskData(task, args, raw, logger.step("HANDLE"));
           logger(`passing response to task's parser as a %s`, task.format);
           if (isBufferTask(task)) {
@@ -51938,17 +52113,36 @@ var init_git_executor_chain = __esm({
         const { exitCode, rejection, stdOut, stdErr } = result;
         return new Promise((done, fail) => {
           logger(`Preparing to handle process response exitCode=%d stdOut=`, exitCode);
-          const { error } = this._plugins.exec("task.error", { error: rejection }, __spreadValues(__spreadValues({}, pluginContext(task, args)), result));
+          const { error } = this._plugins.exec(
+            "task.error",
+            { error: rejection },
+            __spreadValues(__spreadValues({}, pluginContext(task, args)), result)
+          );
           if (error && task.onError) {
             logger.info(`exitCode=%s handling with custom error handler`);
-            return task.onError(result, error, (newStdOut) => {
-              logger.info(`custom error handler treated as success`);
-              logger(`custom error returned a %s`, objectToString(newStdOut));
-              done(new GitOutputStreams(Array.isArray(newStdOut) ? Buffer.concat(newStdOut) : newStdOut, Buffer.concat(stdErr)));
-            }, fail);
+            return task.onError(
+              result,
+              error,
+              (newStdOut) => {
+                logger.info(`custom error handler treated as success`);
+                logger(`custom error returned a %s`, objectToString(newStdOut));
+                done(
+                  new GitOutputStreams(
+                    Array.isArray(newStdOut) ? Buffer.concat(newStdOut) : newStdOut,
+                    Buffer.concat(stdErr)
+                  )
+                );
+              },
+              fail
+            );
           }
           if (error) {
-            logger.info(`handling as error: exitCode=%s stdErr=%s rejection=%o`, exitCode, stdErr.length, rejection);
+            logger.info(
+              `handling as error: exitCode=%s stdErr=%s rejection=%o`,
+              exitCode,
+              stdErr.length,
+              rejection
+            );
             return fail(error);
           }
           logger.info(`retrieving task output complete`);
@@ -51958,11 +52152,15 @@ var init_git_executor_chain = __esm({
       gitResponse(task, command, args, outputHandler, logger) {
         return __async(this, null, function* () {
           const outputLogger = logger.sibling("output");
-          const spawnOptions = this._plugins.exec("spawn.options", {
-            cwd: this.cwd,
-            env: this.env,
-            windowsHide: true
-          }, pluginContext(task, task.commands));
+          const spawnOptions = this._plugins.exec(
+            "spawn.options",
+            {
+              cwd: this.cwd,
+              env: this.env,
+              windowsHide: true
+            },
+            pluginContext(task, task.commands)
+          );
           return new Promise((done) => {
             const stdOut = [];
             const stdErr = [];
@@ -51983,8 +52181,14 @@ var init_git_executor_chain = __esm({
               }
             }));
             const spawned = (0,external_child_process_.spawn)(command, args, spawnOptions);
-            spawned.stdout.on("data", onDataReceived(stdOut, "stdOut", logger, outputLogger.step("stdOut")));
-            spawned.stderr.on("data", onDataReceived(stdErr, "stdErr", logger, outputLogger.step("stdErr")));
+            spawned.stdout.on(
+              "data",
+              onDataReceived(stdOut, "stdOut", logger, outputLogger.step("stdOut"))
+            );
+            spawned.stderr.on(
+              "data",
+              onDataReceived(stdErr, "stdErr", logger, outputLogger.step("stdErr"))
+            );
             spawned.on("error", onErrorReceived(stdErr, logger));
             if (outputHandler) {
               logger(`Passing child process stdOut/stdErr to custom outputHandler`);
@@ -52032,10 +52236,10 @@ __export(git_executor_exports, {
 var GitExecutor;
 var init_git_executor = __esm({
   "src/lib/runners/git-executor.ts"() {
+    "use strict";
     init_git_executor_chain();
     GitExecutor = class {
-      constructor(binary = "git", cwd, _scheduler, _plugins) {
-        this.binary = binary;
+      constructor(cwd, _scheduler, _plugins) {
         this.cwd = cwd;
         this._scheduler = _scheduler;
         this._plugins = _plugins;
@@ -52058,14 +52262,19 @@ function taskCallback(task, response, callback = NOOP) {
   };
   const onError2 = (err) => {
     if ((err == null ? void 0 : err.task) === task) {
-      callback(err instanceof GitResponseError ? addDeprecationNoticeToError(err) : err, void 0);
+      callback(
+        err instanceof GitResponseError ? addDeprecationNoticeToError(err) : err,
+        void 0
+      );
     }
   };
   response.then(onSuccess, onError2);
 }
 function addDeprecationNoticeToError(err) {
   let log = (name) => {
-    console.warn(`simple-git deprecation notice: accessing GitResponseError.${name} should be GitResponseError.git.${name}, this will no longer be available in version 3`);
+    console.warn(
+      `simple-git deprecation notice: accessing GitResponseError.${name} should be GitResponseError.git.${name}, this will no longer be available in version 3`
+    );
     log = NOOP;
   };
   return Object.create(err, Object.getOwnPropertyNames(err.git).reduce(descriptorReducer, {}));
@@ -52086,6 +52295,7 @@ function addDeprecationNoticeToError(err) {
 }
 var init_task_callback = __esm({
   "src/lib/task-callback.ts"() {
+    "use strict";
     init_git_response_error();
     init_utils();
   }
@@ -52102,6 +52312,7 @@ function changeWorkingDirectoryTask(directory, root) {
 }
 var init_change_working_directory = __esm({
   "src/lib/tasks/change-working-directory.ts"() {
+    "use strict";
     init_utils();
     init_task();
   }
@@ -52118,18 +52329,28 @@ function checkoutTask(args) {
 function checkout_default() {
   return {
     checkout() {
-      return this._runTask(checkoutTask(getTrailingOptions(arguments, 1)), trailingFunctionArgument(arguments));
+      return this._runTask(
+        checkoutTask(getTrailingOptions(arguments, 1)),
+        trailingFunctionArgument(arguments)
+      );
     },
     checkoutBranch(branchName, startPoint) {
-      return this._runTask(checkoutTask(["-b", branchName, startPoint, ...getTrailingOptions(arguments)]), trailingFunctionArgument(arguments));
+      return this._runTask(
+        checkoutTask(["-b", branchName, startPoint, ...getTrailingOptions(arguments)]),
+        trailingFunctionArgument(arguments)
+      );
     },
     checkoutLocalBranch(branchName) {
-      return this._runTask(checkoutTask(["-b", branchName, ...getTrailingOptions(arguments)]), trailingFunctionArgument(arguments));
+      return this._runTask(
+        checkoutTask(["-b", branchName, ...getTrailingOptions(arguments)]),
+        trailingFunctionArgument(arguments)
+      );
     }
   };
 }
 var init_checkout = __esm({
   "src/lib/tasks/checkout.ts"() {
+    "use strict";
     init_utils();
     init_task();
   }
@@ -52153,6 +52374,7 @@ function parseCommitResult(stdOut) {
 var parsers;
 var init_parse_commit = __esm({
   "src/lib/parsers/parse-commit.ts"() {
+    "use strict";
     init_utils();
     parsers = [
       new LineParser(/^\[([^\s]+)( \([^)]+\))? ([^\]]+)/, (result, [branch, root, commit]) => {
@@ -52171,20 +52393,26 @@ var init_parse_commit = __esm({
           name: parts.join("<").trim()
         };
       }),
-      new LineParser(/(\d+)[^,]*(?:,\s*(\d+)[^,]*)(?:,\s*(\d+))/g, (result, [changes, insertions, deletions]) => {
-        result.summary.changes = parseInt(changes, 10) || 0;
-        result.summary.insertions = parseInt(insertions, 10) || 0;
-        result.summary.deletions = parseInt(deletions, 10) || 0;
-      }),
-      new LineParser(/^(\d+)[^,]*(?:,\s*(\d+)[^(]+\(([+-]))?/, (result, [changes, lines, direction]) => {
-        result.summary.changes = parseInt(changes, 10) || 0;
-        const count = parseInt(lines, 10) || 0;
-        if (direction === "-") {
-          result.summary.deletions = count;
-        } else if (direction === "+") {
-          result.summary.insertions = count;
+      new LineParser(
+        /(\d+)[^,]*(?:,\s*(\d+)[^,]*)(?:,\s*(\d+))/g,
+        (result, [changes, insertions, deletions]) => {
+          result.summary.changes = parseInt(changes, 10) || 0;
+          result.summary.insertions = parseInt(insertions, 10) || 0;
+          result.summary.deletions = parseInt(deletions, 10) || 0;
         }
-      })
+      ),
+      new LineParser(
+        /^(\d+)[^,]*(?:,\s*(\d+)[^(]+\(([+-]))?/,
+        (result, [changes, lines, direction]) => {
+          result.summary.changes = parseInt(changes, 10) || 0;
+          const count = parseInt(lines, 10) || 0;
+          if (direction === "-") {
+            result.summary.deletions = count;
+          } else if (direction === "+") {
+            result.summary.insertions = count;
+          }
+        }
+      )
     ];
   }
 });
@@ -52209,17 +52437,43 @@ function commit_default() {
   return {
     commit(message, ...rest) {
       const next = trailingFunctionArgument(arguments);
-      const task = rejectDeprecatedSignatures(message) || commitTask(asArray(message), asArray(filterType(rest[0], filterStringOrStringArray, [])), [...filterType(rest[1], filterArray, []), ...getTrailingOptions(arguments, 0, true)]);
+      const task = rejectDeprecatedSignatures(message) || commitTask(
+        asArray(message),
+        asArray(filterType(rest[0], filterStringOrStringArray, [])),
+        [...filterType(rest[1], filterArray, []), ...getTrailingOptions(arguments, 0, true)]
+      );
       return this._runTask(task, next);
     }
   };
   function rejectDeprecatedSignatures(message) {
-    return !filterStringOrStringArray(message) && configurationErrorTask(`git.commit: requires the commit message to be supplied as a string/string[]`);
+    return !filterStringOrStringArray(message) && configurationErrorTask(
+      `git.commit: requires the commit message to be supplied as a string/string[]`
+    );
   }
 }
 var init_commit = __esm({
   "src/lib/tasks/commit.ts"() {
+    "use strict";
     init_parse_commit();
+    init_utils();
+    init_task();
+  }
+});
+
+// src/lib/tasks/first-commit.ts
+function first_commit_default() {
+  return {
+    firstCommit() {
+      return this._runTask(
+        straightThroughStringTask(["rev-list", "--max-parents=0", "HEAD"], true),
+        trailingFunctionArgument(arguments)
+      );
+    }
+  };
+}
+var init_first_commit = __esm({
+  "src/lib/tasks/first-commit.ts"() {
+    "use strict";
     init_utils();
     init_task();
   }
@@ -52235,6 +52489,7 @@ function hashObjectTask(filePath, write) {
 }
 var init_hash_object = __esm({
   "src/lib/tasks/hash-object.ts"() {
+    "use strict";
     init_task();
   }
 });
@@ -52263,6 +52518,7 @@ function parseInit(bare, path, text) {
 var InitSummary, initResponseRegex, reInitResponseRegex;
 var init_InitSummary = __esm({
   "src/lib/responses/InitSummary.ts"() {
+    "use strict";
     InitSummary = class {
       constructor(bare, path, existing, gitDir) {
         this.bare = bare;
@@ -52296,6 +52552,7 @@ function initTask(bare = false, path, customArgs) {
 var bareCommand;
 var init_init = __esm({
   "src/lib/tasks/init.ts"() {
+    "use strict";
     init_InitSummary();
     bareCommand = "--bare";
   }
@@ -52317,6 +52574,7 @@ function isLogFormat(customArg) {
 var logFormatRegex;
 var init_log_format = __esm({
   "src/lib/args/log-format.ts"() {
+    "use strict";
     logFormatRegex = /^--(stat|numstat|name-only|name-status)(=|$)/;
   }
 });
@@ -52325,6 +52583,7 @@ var init_log_format = __esm({
 var DiffSummary;
 var init_DiffSummary = __esm({
   "src/lib/responses/DiffSummary.ts"() {
+    "use strict";
     DiffSummary = class {
       constructor() {
         this.changed = 0;
@@ -52344,50 +52603,64 @@ function getDiffParser(format = "" /* NONE */) {
 var statParser, numStatParser, nameOnlyParser, nameStatusParser, diffSummaryParsers;
 var init_parse_diff_summary = __esm({
   "src/lib/parsers/parse-diff-summary.ts"() {
+    "use strict";
     init_log_format();
     init_DiffSummary();
+    init_diff_name_status();
     init_utils();
     statParser = [
-      new LineParser(/(.+)\s+\|\s+(\d+)(\s+[+\-]+)?$/, (result, [file, changes, alterations = ""]) => {
-        result.files.push({
-          file: file.trim(),
-          changes: asNumber(changes),
-          insertions: alterations.replace(/[^+]/g, "").length,
-          deletions: alterations.replace(/[^-]/g, "").length,
-          binary: false
-        });
-      }),
-      new LineParser(/(.+) \|\s+Bin ([0-9.]+) -> ([0-9.]+) ([a-z]+)/, (result, [file, before, after]) => {
-        result.files.push({
-          file: file.trim(),
-          before: asNumber(before),
-          after: asNumber(after),
-          binary: true
-        });
-      }),
-      new LineParser(/(\d+) files? changed\s*((?:, \d+ [^,]+){0,2})/, (result, [changed, summary]) => {
-        const inserted = /(\d+) i/.exec(summary);
-        const deleted = /(\d+) d/.exec(summary);
-        result.changed = asNumber(changed);
-        result.insertions = asNumber(inserted == null ? void 0 : inserted[1]);
-        result.deletions = asNumber(deleted == null ? void 0 : deleted[1]);
-      })
+      new LineParser(
+        /^(.+)\s+\|\s+(\d+)(\s+[+\-]+)?$/,
+        (result, [file, changes, alterations = ""]) => {
+          result.files.push({
+            file: file.trim(),
+            changes: asNumber(changes),
+            insertions: alterations.replace(/[^+]/g, "").length,
+            deletions: alterations.replace(/[^-]/g, "").length,
+            binary: false
+          });
+        }
+      ),
+      new LineParser(
+        /^(.+) \|\s+Bin ([0-9.]+) -> ([0-9.]+) ([a-z]+)/,
+        (result, [file, before, after]) => {
+          result.files.push({
+            file: file.trim(),
+            before: asNumber(before),
+            after: asNumber(after),
+            binary: true
+          });
+        }
+      ),
+      new LineParser(
+        /(\d+) files? changed\s*((?:, \d+ [^,]+){0,2})/,
+        (result, [changed, summary]) => {
+          const inserted = /(\d+) i/.exec(summary);
+          const deleted = /(\d+) d/.exec(summary);
+          result.changed = asNumber(changed);
+          result.insertions = asNumber(inserted == null ? void 0 : inserted[1]);
+          result.deletions = asNumber(deleted == null ? void 0 : deleted[1]);
+        }
+      )
     ];
     numStatParser = [
-      new LineParser(/(\d+)\t(\d+)\t(.+)$/, (result, [changesInsert, changesDelete, file]) => {
-        const insertions = asNumber(changesInsert);
-        const deletions = asNumber(changesDelete);
-        result.changed++;
-        result.insertions += insertions;
-        result.deletions += deletions;
-        result.files.push({
-          file,
-          changes: insertions + deletions,
-          insertions,
-          deletions,
-          binary: false
-        });
-      }),
+      new LineParser(
+        /(\d+)\t(\d+)\t(.+)$/,
+        (result, [changesInsert, changesDelete, file]) => {
+          const insertions = asNumber(changesInsert);
+          const deletions = asNumber(changesDelete);
+          result.changed++;
+          result.insertions += insertions;
+          result.deletions += deletions;
+          result.files.push({
+            file,
+            changes: insertions + deletions,
+            insertions,
+            deletions,
+            binary: false
+          });
+        }
+      ),
       new LineParser(/-\t-\t(.+)$/, (result, [file]) => {
         result.changed++;
         result.files.push({
@@ -52411,16 +52684,20 @@ var init_parse_diff_summary = __esm({
       })
     ];
     nameStatusParser = [
-      new LineParser(/([ACDMRTUXB])\s*(.+)$/, (result, [_status, file]) => {
-        result.changed++;
-        result.files.push({
-          file,
-          changes: 0,
-          insertions: 0,
-          deletions: 0,
-          binary: false
-        });
-      })
+      new LineParser(
+        /([ACDMRTUXB])([0-9]{0,3})\t(.[^\t]*)(\t(.[^\t]*))?$/,
+        (result, [status, _similarity, from, _to, to]) => {
+          result.changed++;
+          result.files.push({
+            file: to != null ? to : from,
+            changes: 0,
+            status: orVoid(isDiffNameStatus(status) && status),
+            insertions: 0,
+            deletions: 0,
+            binary: false
+          });
+        }
+      )
     ];
     diffSummaryParsers = {
       ["" /* NONE */]: statParser,
@@ -52434,17 +52711,27 @@ var init_parse_diff_summary = __esm({
 
 // src/lib/parsers/parse-list-log-summary.ts
 function lineBuilder(tokens, fields) {
-  return fields.reduce((line, field, index) => {
-    line[field] = tokens[index] || "";
-    return line;
-  }, /* @__PURE__ */ Object.create({ diff: null }));
+  return fields.reduce(
+    (line, field, index) => {
+      line[field] = tokens[index] || "";
+      return line;
+    },
+    /* @__PURE__ */ Object.create({ diff: null })
+  );
 }
 function createListLogSummaryParser(splitter = SPLITTER, fields = defaultFieldNames, logFormat = "" /* NONE */) {
   const parseDiffResult = getDiffParser(logFormat);
   return function(stdOut) {
-    const all = toLinesWithContent(stdOut, true, START_BOUNDARY).map(function(item) {
+    const all = toLinesWithContent(
+      stdOut,
+      true,
+      START_BOUNDARY
+    ).map(function(item) {
       const lineDetail = item.trim().split(COMMIT_BOUNDARY);
-      const listLogLine = lineBuilder(lineDetail[0].trim().split(splitter), fields);
+      const listLogLine = lineBuilder(
+        lineDetail[0].trim().split(splitter),
+        fields
+      );
       if (lineDetail.length > 1 && !!lineDetail[1].trim()) {
         listLogLine.diff = parseDiffResult(lineDetail[1]);
       }
@@ -52460,6 +52747,7 @@ function createListLogSummaryParser(splitter = SPLITTER, fields = defaultFieldNa
 var START_BOUNDARY, COMMIT_BOUNDARY, SPLITTER, defaultFieldNames;
 var init_parse_list_log_summary = __esm({
   "src/lib/parsers/parse-list-log-summary.ts"() {
+    "use strict";
     init_utils();
     init_parse_diff_summary();
     init_log_format();
@@ -52493,14 +52781,19 @@ function diffSummaryTask(customArgs) {
 function validateLogFormatConfig(customArgs) {
   const flags = customArgs.filter(isLogFormat);
   if (flags.length > 1) {
-    return configurationErrorTask(`Summary flags are mutually exclusive - pick one of ${flags.join(",")}`);
+    return configurationErrorTask(
+      `Summary flags are mutually exclusive - pick one of ${flags.join(",")}`
+    );
   }
   if (flags.length && customArgs.includes("-z")) {
-    return configurationErrorTask(`Summary flag ${flags} parsing is not compatible with null termination option '-z'`);
+    return configurationErrorTask(
+      `Summary flag ${flags} parsing is not compatible with null termination option '-z'`
+    );
   }
 }
 var init_diff = __esm({
   "src/lib/tasks/diff.ts"() {
+    "use strict";
     init_log_format();
     init_parse_diff_summary();
     init_task();
@@ -52572,7 +52865,10 @@ function log_default() {
   return {
     log(...rest) {
       const next = trailingFunctionArgument(arguments);
-      const options = parseLogOptions(trailingOptionsArgument(arguments), filterType(arguments[0], filterArray));
+      const options = parseLogOptions(
+        trailingOptionsArgument(arguments),
+        filterType(arguments[0], filterArray)
+      );
       const task = rejectDeprecatedSignatures(...rest) || validateLogFormatConfig(options.commands) || createLogTask(options);
       return this._runTask(task, next);
     }
@@ -52581,12 +52877,15 @@ function log_default() {
     return logTask(options.splitter, options.fields, options.commands);
   }
   function rejectDeprecatedSignatures(from, to) {
-    return filterString(from) && filterString(to) && configurationErrorTask(`git.log(string, string) should be replaced with git.log({ from: string, to: string })`);
+    return filterString(from) && filterString(to) && configurationErrorTask(
+      `git.log(string, string) should be replaced with git.log({ from: string, to: string })`
+    );
   }
 }
 var excludeOptions;
 var init_log = __esm({
   "src/lib/tasks/log.ts"() {
+    "use strict";
     init_log_format();
     init_pathspec();
     init_parse_list_log_summary();
@@ -52616,6 +52915,7 @@ var init_log = __esm({
 var MergeSummaryConflict, MergeSummaryDetail;
 var init_MergeSummary = __esm({
   "src/lib/responses/MergeSummary.ts"() {
+    "use strict";
     MergeSummaryConflict = class {
       constructor(reason, file = null, meta) {
         this.reason = reason;
@@ -52652,6 +52952,7 @@ var init_MergeSummary = __esm({
 var PullSummary, PullFailedSummary;
 var init_PullSummary = __esm({
   "src/lib/responses/PullSummary.ts"() {
+    "use strict";
     PullSummary = class {
       constructor() {
         this.remoteMessages = {
@@ -52711,24 +53012,34 @@ function asObjectCount(source) {
 var remoteMessagesObjectParsers;
 var init_parse_remote_objects = __esm({
   "src/lib/parsers/parse-remote-objects.ts"() {
+    "use strict";
     init_utils();
     remoteMessagesObjectParsers = [
-      new RemoteLineParser(/^remote:\s*(enumerating|counting|compressing) objects: (\d+),/i, (result, [action, count]) => {
-        const key = action.toLowerCase();
-        const enumeration = objectEnumerationResult(result.remoteMessages);
-        Object.assign(enumeration, { [key]: asNumber(count) });
-      }),
-      new RemoteLineParser(/^remote:\s*(enumerating|counting|compressing) objects: \d+% \(\d+\/(\d+)\),/i, (result, [action, count]) => {
-        const key = action.toLowerCase();
-        const enumeration = objectEnumerationResult(result.remoteMessages);
-        Object.assign(enumeration, { [key]: asNumber(count) });
-      }),
-      new RemoteLineParser(/total ([^,]+), reused ([^,]+), pack-reused (\d+)/i, (result, [total, reused, packReused]) => {
-        const objects = objectEnumerationResult(result.remoteMessages);
-        objects.total = asObjectCount(total);
-        objects.reused = asObjectCount(reused);
-        objects.packReused = asNumber(packReused);
-      })
+      new RemoteLineParser(
+        /^remote:\s*(enumerating|counting|compressing) objects: (\d+),/i,
+        (result, [action, count]) => {
+          const key = action.toLowerCase();
+          const enumeration = objectEnumerationResult(result.remoteMessages);
+          Object.assign(enumeration, { [key]: asNumber(count) });
+        }
+      ),
+      new RemoteLineParser(
+        /^remote:\s*(enumerating|counting|compressing) objects: \d+% \(\d+\/(\d+)\),/i,
+        (result, [action, count]) => {
+          const key = action.toLowerCase();
+          const enumeration = objectEnumerationResult(result.remoteMessages);
+          Object.assign(enumeration, { [key]: asNumber(count) });
+        }
+      ),
+      new RemoteLineParser(
+        /total ([^,]+), reused ([^,]+), pack-reused (\d+)/i,
+        (result, [total, reused, packReused]) => {
+          const objects = objectEnumerationResult(result.remoteMessages);
+          objects.total = asObjectCount(total);
+          objects.reused = asObjectCount(reused);
+          objects.packReused = asNumber(packReused);
+        }
+      )
     ];
   }
 });
@@ -52740,6 +53051,7 @@ function parseRemoteMessages(_stdOut, stdErr) {
 var parsers2, RemoteMessageSummary;
 var init_parse_remote_messages = __esm({
   "src/lib/parsers/parse-remote-messages.ts"() {
+    "use strict";
     init_utils();
     init_parse_remote_objects();
     parsers2 = [
@@ -52748,16 +53060,22 @@ var init_parse_remote_messages = __esm({
         return false;
       }),
       ...remoteMessagesObjectParsers,
-      new RemoteLineParser([/create a (?:pull|merge) request/i, /\s(https?:\/\/\S+)$/], (result, [pullRequestUrl]) => {
-        result.remoteMessages.pullRequestUrl = pullRequestUrl;
-      }),
-      new RemoteLineParser([/found (\d+) vulnerabilities.+\(([^)]+)\)/i, /\s(https?:\/\/\S+)$/], (result, [count, summary, url]) => {
-        result.remoteMessages.vulnerabilities = {
-          count: asNumber(count),
-          summary,
-          url
-        };
-      })
+      new RemoteLineParser(
+        [/create a (?:pull|merge) request/i, /\s(https?:\/\/\S+)$/],
+        (result, [pullRequestUrl]) => {
+          result.remoteMessages.pullRequestUrl = pullRequestUrl;
+        }
+      ),
+      new RemoteLineParser(
+        [/found (\d+) vulnerabilities.+\(([^)]+)\)/i, /\s(https?:\/\/\S+)$/],
+        (result, [count, summary, url]) => {
+          result.remoteMessages.vulnerabilities = {
+            count: asNumber(count),
+            summary,
+            url
+          };
+        }
+      )
     ];
     RemoteMessageSummary = class {
       constructor() {
@@ -52775,6 +53093,7 @@ function parsePullErrorResult(stdOut, stdErr) {
 var FILE_UPDATE_REGEX, SUMMARY_REGEX, ACTION_REGEX, parsers3, errorParsers, parsePullDetail, parsePullResult;
 var init_parse_pull = __esm({
   "src/lib/parsers/parse-pull.ts"() {
+    "use strict";
     init_PullSummary();
     init_utils();
     init_parse_remote_messages();
@@ -52808,18 +53127,25 @@ var init_parse_pull = __esm({
     errorParsers = [
       new LineParser(/^from\s(.+)$/i, (result, [remote]) => void (result.remote = remote)),
       new LineParser(/^fatal:\s(.+)$/, (result, [message]) => void (result.message = message)),
-      new LineParser(/([a-z0-9]+)\.\.([a-z0-9]+)\s+(\S+)\s+->\s+(\S+)$/, (result, [hashLocal, hashRemote, branchLocal, branchRemote]) => {
-        result.branch.local = branchLocal;
-        result.hash.local = hashLocal;
-        result.branch.remote = branchRemote;
-        result.hash.remote = hashRemote;
-      })
+      new LineParser(
+        /([a-z0-9]+)\.\.([a-z0-9]+)\s+(\S+)\s+->\s+(\S+)$/,
+        (result, [hashLocal, hashRemote, branchLocal, branchRemote]) => {
+          result.branch.local = branchLocal;
+          result.hash.local = hashLocal;
+          result.branch.remote = branchRemote;
+          result.hash.remote = hashRemote;
+        }
+      )
     ];
     parsePullDetail = (stdOut, stdErr) => {
       return parseStringResponse(new PullSummary(), parsers3, [stdOut, stdErr]);
     };
     parsePullResult = (stdOut, stdErr) => {
-      return Object.assign(new PullSummary(), parsePullDetail(stdOut, stdErr), parseRemoteMessages(stdOut, stdErr));
+      return Object.assign(
+        new PullSummary(),
+        parsePullDetail(stdOut, stdErr),
+        parseRemoteMessages(stdOut, stdErr)
+      );
     };
   }
 });
@@ -52828,6 +53154,7 @@ var init_parse_pull = __esm({
 var parsers4, parseMergeResult, parseMergeDetail;
 var init_parse_merge = __esm({
   "src/lib/parsers/parse-merge.ts"() {
+    "use strict";
     init_MergeSummary();
     init_utils();
     init_parse_pull();
@@ -52838,9 +53165,12 @@ var init_parse_merge = __esm({
       new LineParser(/^CONFLICT\s+\((.+)\): Merge conflict in (.+)$/, (summary, [reason, file]) => {
         summary.conflicts.push(new MergeSummaryConflict(reason, file));
       }),
-      new LineParser(/^CONFLICT\s+\((.+\/delete)\): (.+) deleted in (.+) and/, (summary, [reason, file, deleteRef]) => {
-        summary.conflicts.push(new MergeSummaryConflict(reason, file, { deleteRef }));
-      }),
+      new LineParser(
+        /^CONFLICT\s+\((.+\/delete)\): (.+) deleted in (.+) and/,
+        (summary, [reason, file, deleteRef]) => {
+          summary.conflicts.push(new MergeSummaryConflict(reason, file, { deleteRef }));
+        }
+      ),
       new LineParser(/^CONFLICT\s+\((.+)\):/, (summary, [reason]) => {
         summary.conflicts.push(new MergeSummaryConflict(reason, null));
       }),
@@ -52876,6 +53206,7 @@ function mergeTask(customArgs) {
 }
 var init_merge = __esm({
   "src/lib/tasks/merge.ts"() {
+    "use strict";
     init_git_response_error();
     init_parse_merge();
     init_task();
@@ -52900,6 +53231,7 @@ function pushResultPushedItem(local, remote, status) {
 var parsers5, parsePushResult, parsePushDetail;
 var init_parse_push = __esm({
   "src/lib/parsers/parse-push.ts"() {
+    "use strict";
     init_utils();
     init_parse_remote_messages();
     parsers5 = [
@@ -52914,25 +53246,31 @@ var init_parse_push = __esm({
       new LineParser(/^[=*-]\s+([^:]+):(\S+)\s+\[(.+)]$/, (result, [local, remote, type]) => {
         result.pushed.push(pushResultPushedItem(local, remote, type));
       }),
-      new LineParser(/^Branch '([^']+)' set up to track remote branch '([^']+)' from '([^']+)'/, (result, [local, remote, remoteName]) => {
-        result.branch = __spreadProps(__spreadValues({}, result.branch || {}), {
-          local,
-          remote,
-          remoteName
-        });
-      }),
-      new LineParser(/^([^:]+):(\S+)\s+([a-z0-9]+)\.\.([a-z0-9]+)$/, (result, [local, remote, from, to]) => {
-        result.update = {
-          head: {
+      new LineParser(
+        /^Branch '([^']+)' set up to track remote branch '([^']+)' from '([^']+)'/,
+        (result, [local, remote, remoteName]) => {
+          result.branch = __spreadProps(__spreadValues({}, result.branch || {}), {
             local,
-            remote
-          },
-          hash: {
-            from,
-            to
-          }
-        };
-      })
+            remote,
+            remoteName
+          });
+        }
+      ),
+      new LineParser(
+        /^([^:]+):(\S+)\s+([a-z0-9]+)\.\.([a-z0-9]+)$/,
+        (result, [local, remote, from, to]) => {
+          result.update = {
+            head: {
+              local,
+              remote
+            },
+            hash: {
+              from,
+              to
+            }
+          };
+        }
+      )
     ];
     parsePushResult = (stdOut, stdErr) => {
       const pushDetail = parsePushDetail(stdOut, stdErr);
@@ -52974,6 +53312,7 @@ function pushTask(ref = {}, customArgs) {
 }
 var init_push = __esm({
   "src/lib/tasks/push.ts"() {
+    "use strict";
     init_parse_push();
     init_utils();
   }
@@ -52987,16 +53326,23 @@ function show_default() {
       if (!commands.includes("--binary")) {
         commands.splice(1, 0, "--binary");
       }
-      return this._runTask(straightThroughBufferTask(commands), trailingFunctionArgument(arguments));
+      return this._runTask(
+        straightThroughBufferTask(commands),
+        trailingFunctionArgument(arguments)
+      );
     },
     show() {
       const commands = ["show", ...getTrailingOptions(arguments, 1)];
-      return this._runTask(straightThroughStringTask(commands), trailingFunctionArgument(arguments));
+      return this._runTask(
+        straightThroughStringTask(commands),
+        trailingFunctionArgument(arguments)
+      );
     }
   };
 }
 var init_show = __esm({
   "src/lib/tasks/show.ts"() {
+    "use strict";
     init_utils();
     init_task();
   }
@@ -53006,13 +53352,14 @@ var init_show = __esm({
 var fromPathRegex, FileStatusSummary;
 var init_FileStatusSummary = __esm({
   "src/lib/responses/FileStatusSummary.ts"() {
+    "use strict";
     fromPathRegex = /^(.+) -> (.+)$/;
     FileStatusSummary = class {
       constructor(path, index, working_dir) {
         this.path = path;
         this.index = index;
         this.working_dir = working_dir;
-        if (index + working_dir === "R") {
+        if ("R" === index + working_dir) {
           const detail = fromPathRegex.exec(path) || [null, path, path];
           this.from = detail[1] || "";
           this.path = detail[2] || "";
@@ -53060,6 +53407,7 @@ function splitLine(result, lineStr) {
 var StatusSummary, parsers6, parseStatusSummary;
 var init_StatusSummary = __esm({
   "src/lib/responses/StatusSummary.ts"() {
+    "use strict";
     init_utils();
     init_FileStatusSummary();
     StatusSummary = class {
@@ -53084,14 +53432,46 @@ var init_StatusSummary = __esm({
       }
     };
     parsers6 = new Map([
-      parser2(" " /* NONE */, "A" /* ADDED */, (result, file) => append(result.created, file)),
-      parser2(" " /* NONE */, "D" /* DELETED */, (result, file) => append(result.deleted, file)),
-      parser2(" " /* NONE */, "M" /* MODIFIED */, (result, file) => append(result.modified, file)),
-      parser2("A" /* ADDED */, " " /* NONE */, (result, file) => append(result.created, file) && append(result.staged, file)),
-      parser2("A" /* ADDED */, "M" /* MODIFIED */, (result, file) => append(result.created, file) && append(result.staged, file) && append(result.modified, file)),
-      parser2("D" /* DELETED */, " " /* NONE */, (result, file) => append(result.deleted, file) && append(result.staged, file)),
-      parser2("M" /* MODIFIED */, " " /* NONE */, (result, file) => append(result.modified, file) && append(result.staged, file)),
-      parser2("M" /* MODIFIED */, "M" /* MODIFIED */, (result, file) => append(result.modified, file) && append(result.staged, file)),
+      parser2(
+        " " /* NONE */,
+        "A" /* ADDED */,
+        (result, file) => append(result.created, file)
+      ),
+      parser2(
+        " " /* NONE */,
+        "D" /* DELETED */,
+        (result, file) => append(result.deleted, file)
+      ),
+      parser2(
+        " " /* NONE */,
+        "M" /* MODIFIED */,
+        (result, file) => append(result.modified, file)
+      ),
+      parser2(
+        "A" /* ADDED */,
+        " " /* NONE */,
+        (result, file) => append(result.created, file) && append(result.staged, file)
+      ),
+      parser2(
+        "A" /* ADDED */,
+        "M" /* MODIFIED */,
+        (result, file) => append(result.created, file) && append(result.staged, file) && append(result.modified, file)
+      ),
+      parser2(
+        "D" /* DELETED */,
+        " " /* NONE */,
+        (result, file) => append(result.deleted, file) && append(result.staged, file)
+      ),
+      parser2(
+        "M" /* MODIFIED */,
+        " " /* NONE */,
+        (result, file) => append(result.modified, file) && append(result.staged, file)
+      ),
+      parser2(
+        "M" /* MODIFIED */,
+        "M" /* MODIFIED */,
+        (result, file) => append(result.modified, file) && append(result.staged, file)
+      ),
       parser2("R" /* RENAMED */, " " /* NONE */, (result, file) => {
         append(result.renamed, renamedFile(file));
       }),
@@ -53103,10 +53483,23 @@ var init_StatusSummary = __esm({
       parser2("!" /* IGNORED */, "!" /* IGNORED */, (_result, _file) => {
         append(_result.ignored = _result.ignored || [], _file);
       }),
-      parser2("?" /* UNTRACKED */, "?" /* UNTRACKED */, (result, file) => append(result.not_added, file)),
+      parser2(
+        "?" /* UNTRACKED */,
+        "?" /* UNTRACKED */,
+        (result, file) => append(result.not_added, file)
+      ),
       ...conflicts("A" /* ADDED */, "A" /* ADDED */, "U" /* UNMERGED */),
-      ...conflicts("D" /* DELETED */, "D" /* DELETED */, "U" /* UNMERGED */),
-      ...conflicts("U" /* UNMERGED */, "A" /* ADDED */, "D" /* DELETED */, "U" /* UNMERGED */),
+      ...conflicts(
+        "D" /* DELETED */,
+        "D" /* DELETED */,
+        "U" /* UNMERGED */
+      ),
+      ...conflicts(
+        "U" /* UNMERGED */,
+        "A" /* ADDED */,
+        "D" /* DELETED */,
+        "U" /* UNMERGED */
+      ),
       [
         "##",
         (result, line) => {
@@ -53169,6 +53562,7 @@ function statusTask(customArgs) {
 var ignoredOptions;
 var init_status = __esm({
   "src/lib/tasks/status.ts"() {
+    "use strict";
     init_StatusSummary();
     ignoredOptions = ["--null", "-z"];
   }
@@ -53176,19 +53570,23 @@ var init_status = __esm({
 
 // src/lib/tasks/version.ts
 function versionResponse(major = 0, minor = 0, patch = 0, agent = "", installed = true) {
-  return Object.defineProperty({
-    major,
-    minor,
-    patch,
-    agent,
-    installed
-  }, "toString", {
-    value() {
-      return `${this.major}.${this.minor}.${this.patch}`;
+  return Object.defineProperty(
+    {
+      major,
+      minor,
+      patch,
+      agent,
+      installed
     },
-    configurable: false,
-    enumerable: false
-  });
+    "toString",
+    {
+      value() {
+        return `${this.major}.${this.minor}.${this.patch}`;
+      },
+      configurable: false,
+      enumerable: false
+    }
+  );
 }
 function notInstalledResponse() {
   return versionResponse(0, 0, 0, "", false);
@@ -53219,15 +53617,25 @@ function versionParser(stdOut) {
 var NOT_INSTALLED, parsers7;
 var init_version = __esm({
   "src/lib/tasks/version.ts"() {
+    "use strict";
     init_utils();
     NOT_INSTALLED = "installed=false";
     parsers7 = [
-      new LineParser(/version (\d+)\.(\d+)\.(\d+)(?:\s*\((.+)\))?/, (result, [major, minor, patch, agent = ""]) => {
-        Object.assign(result, versionResponse(asNumber(major), asNumber(minor), asNumber(patch), agent));
-      }),
-      new LineParser(/version (\d+)\.(\d+)\.(\D+)(.+)?$/, (result, [major, minor, patch, agent = ""]) => {
-        Object.assign(result, versionResponse(asNumber(major), asNumber(minor), patch, agent));
-      })
+      new LineParser(
+        /version (\d+)\.(\d+)\.(\d+)(?:\s*\((.+)\))?/,
+        (result, [major, minor, patch, agent = ""]) => {
+          Object.assign(
+            result,
+            versionResponse(asNumber(major), asNumber(minor), asNumber(patch), agent)
+          );
+        }
+      ),
+      new LineParser(
+        /version (\d+)\.(\d+)\.(\D+)(.+)?$/,
+        (result, [major, minor, patch, agent = ""]) => {
+          Object.assign(result, versionResponse(asNumber(major), asNumber(minor), patch, agent));
+        }
+      )
     ];
   }
 });
@@ -53240,11 +53648,13 @@ __export(simple_git_api_exports, {
 var SimpleGitApi;
 var init_simple_git_api = __esm({
   "src/lib/simple-git-api.ts"() {
+    "use strict";
     init_task_callback();
     init_change_working_directory();
     init_checkout();
     init_commit();
     init_config();
+    init_first_commit();
     init_grep();
     init_hash_object();
     init_init();
@@ -53273,7 +53683,10 @@ var init_simple_git_api = __esm({
         });
       }
       add(files) {
-        return this._runTask(straightThroughStringTask(["add", ...asArray(files)]), trailingFunctionArgument(arguments));
+        return this._runTask(
+          straightThroughStringTask(["add", ...asArray(files)]),
+          trailingFunctionArgument(arguments)
+        );
       }
       cwd(directory) {
         const next = trailingFunctionArgument(arguments);
@@ -53281,44 +53694,88 @@ var init_simple_git_api = __esm({
           return this._runTask(changeWorkingDirectoryTask(directory, this._executor), next);
         }
         if (typeof (directory == null ? void 0 : directory.path) === "string") {
-          return this._runTask(changeWorkingDirectoryTask(directory.path, directory.root && this._executor || void 0), next);
+          return this._runTask(
+            changeWorkingDirectoryTask(
+              directory.path,
+              directory.root && this._executor || void 0
+            ),
+            next
+          );
         }
-        return this._runTask(configurationErrorTask("Git.cwd: workingDirectory must be supplied as a string"), next);
+        return this._runTask(
+          configurationErrorTask("Git.cwd: workingDirectory must be supplied as a string"),
+          next
+        );
       }
       hashObject(path, write) {
-        return this._runTask(hashObjectTask(path, write === true), trailingFunctionArgument(arguments));
+        return this._runTask(
+          hashObjectTask(path, write === true),
+          trailingFunctionArgument(arguments)
+        );
       }
       init(bare) {
-        return this._runTask(initTask(bare === true, this._executor.cwd, getTrailingOptions(arguments)), trailingFunctionArgument(arguments));
+        return this._runTask(
+          initTask(bare === true, this._executor.cwd, getTrailingOptions(arguments)),
+          trailingFunctionArgument(arguments)
+        );
       }
       merge() {
-        return this._runTask(mergeTask(getTrailingOptions(arguments)), trailingFunctionArgument(arguments));
+        return this._runTask(
+          mergeTask(getTrailingOptions(arguments)),
+          trailingFunctionArgument(arguments)
+        );
       }
       mergeFromTo(remote, branch) {
         if (!(filterString(remote) && filterString(branch))) {
-          return this._runTask(configurationErrorTask(`Git.mergeFromTo requires that the 'remote' and 'branch' arguments are supplied as strings`));
+          return this._runTask(
+            configurationErrorTask(
+              `Git.mergeFromTo requires that the 'remote' and 'branch' arguments are supplied as strings`
+            )
+          );
         }
-        return this._runTask(mergeTask([remote, branch, ...getTrailingOptions(arguments)]), trailingFunctionArgument(arguments, false));
+        return this._runTask(
+          mergeTask([remote, branch, ...getTrailingOptions(arguments)]),
+          trailingFunctionArgument(arguments, false)
+        );
       }
       outputHandler(handler) {
         this._executor.outputHandler = handler;
         return this;
       }
       push() {
-        const task = pushTask({
-          remote: filterType(arguments[0], filterString),
-          branch: filterType(arguments[1], filterString)
-        }, getTrailingOptions(arguments));
+        const task = pushTask(
+          {
+            remote: filterType(arguments[0], filterString),
+            branch: filterType(arguments[1], filterString)
+          },
+          getTrailingOptions(arguments)
+        );
         return this._runTask(task, trailingFunctionArgument(arguments));
       }
       stash() {
-        return this._runTask(straightThroughStringTask(["stash", ...getTrailingOptions(arguments)]), trailingFunctionArgument(arguments));
+        return this._runTask(
+          straightThroughStringTask(["stash", ...getTrailingOptions(arguments)]),
+          trailingFunctionArgument(arguments)
+        );
       }
       status() {
-        return this._runTask(statusTask(getTrailingOptions(arguments)), trailingFunctionArgument(arguments));
+        return this._runTask(
+          statusTask(getTrailingOptions(arguments)),
+          trailingFunctionArgument(arguments)
+        );
       }
     };
-    Object.assign(SimpleGitApi.prototype, checkout_default(), commit_default(), config_default(), grep_default(), log_default(), show_default(), version_default());
+    Object.assign(
+      SimpleGitApi.prototype,
+      checkout_default(),
+      commit_default(),
+      config_default(),
+      first_commit_default(),
+      grep_default(),
+      log_default(),
+      show_default(),
+      version_default()
+    );
   }
 });
 
@@ -53331,6 +53788,7 @@ __export(scheduler_exports, {
 var createScheduledTask, Scheduler;
 var init_scheduler = __esm({
   "src/lib/runners/scheduler.ts"() {
+    "use strict";
     init_utils();
     init_git_logger();
     createScheduledTask = (() => {
@@ -53355,7 +53813,12 @@ var init_scheduler = __esm({
       }
       schedule() {
         if (!this.pending.length || this.running.length >= this.concurrency) {
-          this.logger(`Schedule attempt ignored, pending=%s running=%s concurrency=%s`, this.pending.length, this.running.length, this.concurrency);
+          this.logger(
+            `Schedule attempt ignored, pending=%s running=%s concurrency=%s`,
+            this.pending.length,
+            this.running.length,
+            this.concurrency
+          );
           return;
         }
         const task = append(this.running, this.pending.shift());
@@ -53386,6 +53849,7 @@ function applyPatchTask(patches, customArgs) {
 }
 var init_apply_patch = __esm({
   "src/lib/tasks/apply-patch.ts"() {
+    "use strict";
     init_task();
   }
 });
@@ -53408,6 +53872,7 @@ function branchDeletionFailure(branch) {
 var BranchDeletionBatch;
 var init_BranchDeleteSummary = __esm({
   "src/lib/responses/BranchDeleteSummary.ts"() {
+    "use strict";
     BranchDeletionBatch = class {
       constructor() {
         this.all = [];
@@ -53428,6 +53893,7 @@ function hasBranchDeletionError(data, processExitCode) {
 var deleteSuccessRegex, deleteErrorRegex, parsers8, parseBranchDeletions;
 var init_parse_branch_delete = __esm({
   "src/lib/parsers/parse-branch-delete.ts"() {
+    "use strict";
     init_BranchDeleteSummary();
     init_utils();
     deleteSuccessRegex = /(\S+)\s+\(\S+\s([^)]+)\)/;
@@ -53455,6 +53921,7 @@ var init_parse_branch_delete = __esm({
 var BranchSummaryResult;
 var init_BranchSummary = __esm({
   "src/lib/responses/BranchSummary.ts"() {
+    "use strict";
     BranchSummaryResult = class {
       constructor() {
         this.all = [];
@@ -53490,15 +53957,22 @@ function parseBranchSummary(stdOut) {
 var parsers9;
 var init_parse_branch = __esm({
   "src/lib/parsers/parse-branch.ts"() {
+    "use strict";
     init_BranchSummary();
     init_utils();
     parsers9 = [
-      new LineParser(/^([*+]\s)?\((?:HEAD )?detached (?:from|at) (\S+)\)\s+([a-z0-9]+)\s(.*)$/, (result, [current, name, commit, label]) => {
-        result.push(branchStatus(current), true, name, commit, label);
-      }),
-      new LineParser(/^([*+]\s)?(\S+)\s+([a-z0-9]+)\s?(.*)$/s, (result, [current, name, commit, label]) => {
-        result.push(branchStatus(current), false, name, commit, label);
-      })
+      new LineParser(
+        /^([*+]\s)?\((?:HEAD )?detached (?:from|at) (\S+)\)\s+([a-z0-9]+)\s(.*)$/,
+        (result, [current, name, commit, label]) => {
+          result.push(branchStatus(current), true, name, commit, label);
+        }
+      ),
+      new LineParser(
+        new RegExp("^([*+]\\s)?(\\S+)\\s+([a-z0-9]+)\\s?(.*)$", "s"),
+        (result, [current, name, commit, label]) => {
+          result.push(branchStatus(current), false, name, commit, label);
+        }
+      )
     ];
   }
 });
@@ -53570,13 +54044,17 @@ function deleteBranchTask(branch, forceDelete = false) {
       if (!hasBranchDeletionError(String(error), exitCode)) {
         return fail(error);
       }
-      throw new GitResponseError(task.parser(bufferToString(stdOut), bufferToString(stdErr)), String(error));
+      throw new GitResponseError(
+        task.parser(bufferToString(stdOut), bufferToString(stdErr)),
+        String(error)
+      );
     }
   };
   return task;
 }
 var init_branch = __esm({
   "src/lib/tasks/branch.ts"() {
+    "use strict";
     init_git_response_error();
     init_parse_branch_delete();
     init_parse_branch();
@@ -53588,6 +54066,7 @@ var init_branch = __esm({
 var parseCheckIgnore;
 var init_CheckIgnore = __esm({
   "src/lib/responses/CheckIgnore.ts"() {
+    "use strict";
     parseCheckIgnore = (text) => {
       return text.split(/\n/g).map((line) => line.trim()).filter((file) => !!file);
     };
@@ -53608,6 +54087,7 @@ function checkIgnoreTask(paths) {
 }
 var init_check_ignore = __esm({
   "src/lib/tasks/check-ignore.ts"() {
+    "use strict";
     init_CheckIgnore();
   }
 });
@@ -53637,6 +54117,7 @@ function cloneMirrorTask(repo, directory, customArgs) {
 }
 var init_clone = __esm({
   "src/lib/tasks/clone.ts"() {
+    "use strict";
     init_task();
     init_utils();
   }
@@ -53657,6 +54138,7 @@ function parseFetchResult(stdOut, stdErr) {
 var parsers10;
 var init_parse_fetch = __esm({
   "src/lib/parsers/parse-fetch.ts"() {
+    "use strict";
     init_utils();
     parsers10 = [
       new LineParser(/From (.+)$/, (result, [remote]) => {
@@ -53679,14 +54161,17 @@ var init_parse_fetch = __esm({
           tracking
         });
       }),
-      new LineParser(/\s*([^.]+)\.\.(\S+)\s+(\S+)\s*-> (.+)$/, (result, [from, to, name, tracking]) => {
-        result.updated.push({
-          name,
-          tracking,
-          to,
-          from
-        });
-      })
+      new LineParser(
+        /\s*([^.]+)\.\.(\S+)\s+(\S+)\s*-> (.+)$/,
+        (result, [from, to, name, tracking]) => {
+          result.updated.push({
+            name,
+            tracking,
+            to,
+            from
+          });
+        }
+      )
     ];
   }
 });
@@ -53716,6 +54201,7 @@ function fetchTask(remote, branch, customArgs) {
 }
 var init_fetch = __esm({
   "src/lib/tasks/fetch.ts"() {
+    "use strict";
     init_parse_fetch();
     init_task();
   }
@@ -53728,6 +54214,7 @@ function parseMoveResult(stdOut) {
 var parsers11;
 var init_parse_move = __esm({
   "src/lib/parsers/parse-move.ts"() {
+    "use strict";
     init_utils();
     parsers11 = [
       new LineParser(/^Renaming (.+) to (.+)$/, (result, [from, to]) => {
@@ -53751,6 +54238,7 @@ function moveTask(from, to) {
 }
 var init_move = __esm({
   "src/lib/tasks/move.ts"() {
+    "use strict";
     init_parse_move();
     init_utils();
   }
@@ -53773,7 +54261,10 @@ function pullTask(remote, branch, customArgs) {
       return parsePullResult(stdOut, stdErr);
     },
     onError(result, _error, _done, fail) {
-      const pullError = parsePullErrorResult(bufferToString(result.stdOut), bufferToString(result.stdErr));
+      const pullError = parsePullErrorResult(
+        bufferToString(result.stdOut),
+        bufferToString(result.stdErr)
+      );
       if (pullError) {
         return fail(new GitResponseError(pullError));
       }
@@ -53783,6 +54274,7 @@ function pullTask(remote, branch, customArgs) {
 }
 var init_pull = __esm({
   "src/lib/tasks/pull.ts"() {
+    "use strict";
     init_git_response_error();
     init_parse_pull();
     init_utils();
@@ -53815,6 +54307,7 @@ function forEach(text, handler) {
 }
 var init_GetRemoteSummary = __esm({
   "src/lib/responses/GetRemoteSummary.ts"() {
+    "use strict";
     init_utils();
   }
 });
@@ -53828,7 +54321,7 @@ __export(remote_exports, {
   remoteTask: () => remoteTask,
   removeRemoteTask: () => removeRemoteTask
 });
-function addRemoteTask(remoteName, remoteRepo, customArgs = []) {
+function addRemoteTask(remoteName, remoteRepo, customArgs) {
   return straightThroughStringTask(["remote", "add", ...customArgs, remoteName, remoteRepo]);
 }
 function getRemotesTask(verbose) {
@@ -53842,14 +54335,14 @@ function getRemotesTask(verbose) {
     parser: verbose ? parseGetRemotesVerbose : parseGetRemotes
   };
 }
-function listRemotesTask(customArgs = []) {
+function listRemotesTask(customArgs) {
   const commands = [...customArgs];
   if (commands[0] !== "ls-remote") {
     commands.unshift("ls-remote");
   }
   return straightThroughStringTask(commands);
 }
-function remoteTask(customArgs = []) {
+function remoteTask(customArgs) {
   const commands = [...customArgs];
   if (commands[0] !== "remote") {
     commands.unshift("remote");
@@ -53861,6 +54354,7 @@ function removeRemoteTask(remoteName) {
 }
 var init_remote = __esm({
   "src/lib/tasks/remote.ts"() {
+    "use strict";
     init_GetRemoteSummary();
     init_task();
   }
@@ -53874,7 +54368,11 @@ __export(stash_list_exports, {
 function stashListTask(opt = {}, customArgs) {
   const options = parseLogOptions(opt);
   const commands = ["stash", "list", ...options.commands, ...customArgs];
-  const parser3 = createListLogSummaryParser(options.splitter, options.fields, logFormatFromCommand(commands));
+  const parser3 = createListLogSummaryParser(
+    options.splitter,
+    options.fields,
+    logFormatFromCommand(commands)
+  );
   return validateLogFormatConfig(commands) || {
     commands,
     format: "utf-8",
@@ -53883,6 +54381,7 @@ function stashListTask(opt = {}, customArgs) {
 }
 var init_stash_list = __esm({
   "src/lib/tasks/stash-list.ts"() {
+    "use strict";
     init_log_format();
     init_parse_list_log_summary();
     init_diff();
@@ -53916,6 +54415,7 @@ function updateSubModuleTask(customArgs) {
 }
 var init_sub_module = __esm({
   "src/lib/tasks/sub-module.ts"() {
+    "use strict";
     init_task();
   }
 });
@@ -53944,6 +54444,7 @@ function toNumber(input) {
 var TagList, parseTagList;
 var init_TagList = __esm({
   "src/lib/responses/TagList.ts"() {
+    "use strict";
     TagList = class {
       constructor(all, latest) {
         this.all = all;
@@ -54011,6 +54512,7 @@ function addAnnotatedTagTask(name, tagMessage) {
 }
 var init_tag = __esm({
   "src/lib/tasks/tag.ts"() {
+    "use strict";
     init_TagList();
   }
 });
@@ -54018,6 +54520,7 @@ var init_tag = __esm({
 // src/git.js
 var require_git = __commonJS({
   "src/git.js"(exports, module) {
+    "use strict";
     var { GitExecutor: GitExecutor2 } = (init_git_executor(), __toCommonJS(git_executor_exports));
     var { SimpleGitApi: SimpleGitApi2 } = (init_simple_git_api(), __toCommonJS(simple_git_api_exports));
     var { Scheduler: Scheduler2 } = (init_scheduler(), __toCommonJS(scheduler_exports));
@@ -54067,12 +54570,17 @@ var require_git = __commonJS({
     var { addAnnotatedTagTask: addAnnotatedTagTask2, addTagTask: addTagTask2, tagListTask: tagListTask2 } = (init_tag(), __toCommonJS(tag_exports));
     var { straightThroughBufferTask: straightThroughBufferTask2, straightThroughStringTask: straightThroughStringTask2 } = (init_task(), __toCommonJS(task_exports));
     function Git2(options, plugins) {
-      this._executor = new GitExecutor2(options.binary, options.baseDir, new Scheduler2(options.maxConcurrentProcesses), plugins);
+      this._plugins = plugins;
+      this._executor = new GitExecutor2(
+        options.baseDir,
+        new Scheduler2(options.maxConcurrentProcesses),
+        plugins
+      );
       this._trimmed = options.trimmed;
     }
     (Git2.prototype = Object.create(SimpleGitApi2.prototype)).constructor = Git2;
     Git2.prototype.customBinary = function(command) {
-      this._executor.binary = command;
+      this._plugins.reconfigure("binary", command);
       return this;
     };
     Git2.prototype.env = function(name, value) {
@@ -54084,7 +54592,13 @@ var require_git = __commonJS({
       return this;
     };
     Git2.prototype.stashList = function(options) {
-      return this._runTask(stashListTask2(trailingOptionsArgument2(arguments) || {}, filterArray2(options) && options || []), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        stashListTask2(
+          trailingOptionsArgument2(arguments) || {},
+          filterArray2(options) && options || []
+        ),
+        trailingFunctionArgument2(arguments)
+      );
     };
     function createCloneTask(api, task, repoPath, localPath) {
       if (typeof repoPath !== "string") {
@@ -54093,10 +54607,16 @@ var require_git = __commonJS({
       return task(repoPath, filterType2(localPath, filterString2), getTrailingOptions2(arguments));
     }
     Git2.prototype.clone = function() {
-      return this._runTask(createCloneTask("clone", cloneTask2, ...arguments), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        createCloneTask("clone", cloneTask2, ...arguments),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.mirror = function() {
-      return this._runTask(createCloneTask("mirror", cloneMirrorTask2, ...arguments), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        createCloneTask("mirror", cloneMirrorTask2, ...arguments),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.mv = function(from, to) {
       return this._runTask(moveTask2(from, to), trailingFunctionArgument2(arguments));
@@ -54110,46 +54630,86 @@ var require_git = __commonJS({
       });
     };
     Git2.prototype.pull = function(remote, branch, options, then) {
-      return this._runTask(pullTask2(filterType2(remote, filterString2), filterType2(branch, filterString2), getTrailingOptions2(arguments)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        pullTask2(
+          filterType2(remote, filterString2),
+          filterType2(branch, filterString2),
+          getTrailingOptions2(arguments)
+        ),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.fetch = function(remote, branch) {
-      return this._runTask(fetchTask2(filterType2(remote, filterString2), filterType2(branch, filterString2), getTrailingOptions2(arguments)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        fetchTask2(
+          filterType2(remote, filterString2),
+          filterType2(branch, filterString2),
+          getTrailingOptions2(arguments)
+        ),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.silent = function(silence) {
-      console.warn("simple-git deprecation notice: git.silent: logging should be configured using the `debug` library / `DEBUG` environment variable, this will be an error in version 3");
+      console.warn(
+        "simple-git deprecation notice: git.silent: logging should be configured using the `debug` library / `DEBUG` environment variable, this will be an error in version 3"
+      );
       return this;
     };
     Git2.prototype.tags = function(options, then) {
-      return this._runTask(tagListTask2(getTrailingOptions2(arguments)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        tagListTask2(getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.rebase = function() {
-      return this._runTask(straightThroughStringTask2(["rebase", ...getTrailingOptions2(arguments)]), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        straightThroughStringTask2(["rebase", ...getTrailingOptions2(arguments)]),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.reset = function(mode) {
-      return this._runTask(resetTask2(getResetMode2(mode), getTrailingOptions2(arguments)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        resetTask2(getResetMode2(mode), getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.revert = function(commit) {
       const next = trailingFunctionArgument2(arguments);
       if (typeof commit !== "string") {
         return this._runTask(configurationErrorTask2("Commit must be a string"), next);
       }
-      return this._runTask(straightThroughStringTask2(["revert", ...getTrailingOptions2(arguments, 0, true), commit]), next);
+      return this._runTask(
+        straightThroughStringTask2(["revert", ...getTrailingOptions2(arguments, 0, true), commit]),
+        next
+      );
     };
     Git2.prototype.addTag = function(name) {
       const task = typeof name === "string" ? addTagTask2(name) : configurationErrorTask2("Git.addTag requires a tag name");
       return this._runTask(task, trailingFunctionArgument2(arguments));
     };
     Git2.prototype.addAnnotatedTag = function(tagName, tagMessage) {
-      return this._runTask(addAnnotatedTagTask2(tagName, tagMessage), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        addAnnotatedTagTask2(tagName, tagMessage),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.deleteLocalBranch = function(branchName, forceDelete, then) {
-      return this._runTask(deleteBranchTask2(branchName, typeof forceDelete === "boolean" ? forceDelete : false), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        deleteBranchTask2(branchName, typeof forceDelete === "boolean" ? forceDelete : false),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.deleteLocalBranches = function(branchNames, forceDelete, then) {
-      return this._runTask(deleteBranchesTask2(branchNames, typeof forceDelete === "boolean" ? forceDelete : false), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        deleteBranchesTask2(branchNames, typeof forceDelete === "boolean" ? forceDelete : false),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.branch = function(options, then) {
-      return this._runTask(branchTask2(getTrailingOptions2(arguments)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        branchTask2(getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.branchLocal = function(then) {
       return this._runTask(branchLocalTask2(), trailingFunctionArgument2(arguments));
@@ -54166,7 +54726,10 @@ var require_git = __commonJS({
       command.push(...getTrailingOptions2(arguments, 0, true));
       var next = trailingFunctionArgument2(arguments);
       if (!command.length) {
-        return this._runTask(configurationErrorTask2("Raw: must supply one or more command to execute"), next);
+        return this._runTask(
+          configurationErrorTask2("Raw: must supply one or more command to execute"),
+          next
+        );
       }
       return this._runTask(straightThroughStringTask2(command, this._trimmed), next);
     };
@@ -54174,19 +54737,34 @@ var require_git = __commonJS({
       return this._runTask(addSubModuleTask2(repo, path), trailingFunctionArgument2(arguments));
     };
     Git2.prototype.submoduleUpdate = function(args, then) {
-      return this._runTask(updateSubModuleTask2(getTrailingOptions2(arguments, true)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        updateSubModuleTask2(getTrailingOptions2(arguments, true)),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.submoduleInit = function(args, then) {
-      return this._runTask(initSubModuleTask2(getTrailingOptions2(arguments, true)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        initSubModuleTask2(getTrailingOptions2(arguments, true)),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.subModule = function(options, then) {
-      return this._runTask(subModuleTask2(getTrailingOptions2(arguments)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        subModuleTask2(getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.listRemote = function() {
-      return this._runTask(listRemotesTask2(getTrailingOptions2(arguments)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        listRemotesTask2(getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.addRemote = function(remoteName, remoteRepo, then) {
-      return this._runTask(addRemoteTask2(remoteName, remoteRepo, getTrailingOptions2(arguments)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        addRemoteTask2(remoteName, remoteRepo, getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.removeRemote = function(remoteName, then) {
       return this._runTask(removeRemoteTask2(remoteName), trailingFunctionArgument2(arguments));
@@ -54195,7 +54773,10 @@ var require_git = __commonJS({
       return this._runTask(getRemotesTask2(verbose === true), trailingFunctionArgument2(arguments));
     };
     Git2.prototype.remote = function(options, then) {
-      return this._runTask(remoteTask2(getTrailingOptions2(arguments)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        remoteTask2(getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.tag = function(options, then) {
       const command = getTrailingOptions2(arguments);
@@ -54205,17 +54786,29 @@ var require_git = __commonJS({
       return this._runTask(straightThroughStringTask2(command), trailingFunctionArgument2(arguments));
     };
     Git2.prototype.updateServerInfo = function(then) {
-      return this._runTask(straightThroughStringTask2(["update-server-info"]), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        straightThroughStringTask2(["update-server-info"]),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.pushTags = function(remote, then) {
-      const task = pushTagsTask2({ remote: filterType2(remote, filterString2) }, getTrailingOptions2(arguments));
+      const task = pushTagsTask2(
+        { remote: filterType2(remote, filterString2) },
+        getTrailingOptions2(arguments)
+      );
       return this._runTask(task, trailingFunctionArgument2(arguments));
     };
     Git2.prototype.rm = function(files) {
-      return this._runTask(straightThroughStringTask2(["rm", "-f", ...asArray2(files)]), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        straightThroughStringTask2(["rm", "-f", ...asArray2(files)]),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.rmKeepLocal = function(files) {
-      return this._runTask(straightThroughStringTask2(["rm", "--cached", ...asArray2(files)]), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        straightThroughStringTask2(["rm", "--cached", ...asArray2(files)]),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.catFile = function(options, then) {
       return this._catFile("utf-8", arguments);
@@ -54228,7 +54821,10 @@ var require_git = __commonJS({
       var command = ["cat-file"];
       var options = args[0];
       if (typeof options === "string") {
-        return this._runTask(configurationErrorTask2("Git.catFile: options must be supplied as an array of strings"), handler);
+        return this._runTask(
+          configurationErrorTask2("Git.catFile: options must be supplied as an array of strings"),
+          handler
+        );
       }
       if (Array.isArray(options)) {
         command.push.apply(command, options);
@@ -54237,25 +54833,38 @@ var require_git = __commonJS({
       return this._runTask(task, handler);
     };
     Git2.prototype.diff = function(options, then) {
-      const task = filterString2(options) ? configurationErrorTask2("git.diff: supplying options as a single string is no longer supported, switch to an array of strings") : straightThroughStringTask2(["diff", ...getTrailingOptions2(arguments)]);
+      const task = filterString2(options) ? configurationErrorTask2(
+        "git.diff: supplying options as a single string is no longer supported, switch to an array of strings"
+      ) : straightThroughStringTask2(["diff", ...getTrailingOptions2(arguments)]);
       return this._runTask(task, trailingFunctionArgument2(arguments));
     };
     Git2.prototype.diffSummary = function() {
-      return this._runTask(diffSummaryTask2(getTrailingOptions2(arguments, 1)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        diffSummaryTask2(getTrailingOptions2(arguments, 1)),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.applyPatch = function(patches) {
-      const task = !filterStringOrStringArray2(patches) ? configurationErrorTask2(`git.applyPatch requires one or more string patches as the first argument`) : applyPatchTask2(asArray2(patches), getTrailingOptions2([].slice.call(arguments, 1)));
+      const task = !filterStringOrStringArray2(patches) ? configurationErrorTask2(
+        `git.applyPatch requires one or more string patches as the first argument`
+      ) : applyPatchTask2(asArray2(patches), getTrailingOptions2([].slice.call(arguments, 1)));
       return this._runTask(task, trailingFunctionArgument2(arguments));
     };
     Git2.prototype.revparse = function() {
       const commands = ["rev-parse", ...getTrailingOptions2(arguments, true)];
-      return this._runTask(straightThroughStringTask2(commands, true), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        straightThroughStringTask2(commands, true),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.clean = function(mode, options, then) {
       const usingCleanOptionsArray = isCleanOptionsArray2(mode);
       const cleanMode = usingCleanOptionsArray && mode.join("") || filterType2(mode, filterString2) || "";
       const customArgs = getTrailingOptions2([].slice.call(arguments, usingCleanOptionsArray ? 1 : 0));
-      return this._runTask(cleanWithOptionsTask2(cleanMode, customArgs), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        cleanWithOptionsTask2(cleanMode, customArgs),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.exec = function(then) {
       const task = {
@@ -54273,10 +54882,16 @@ var require_git = __commonJS({
       return this;
     };
     Git2.prototype.checkIgnore = function(pathnames, then) {
-      return this._runTask(checkIgnoreTask2(asArray2(filterType2(pathnames, filterStringOrStringArray2, []))), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        checkIgnoreTask2(asArray2(filterType2(pathnames, filterStringOrStringArray2, []))),
+        trailingFunctionArgument2(arguments)
+      );
     };
     Git2.prototype.checkIsRepo = function(checkType, then) {
-      return this._runTask(checkIsRepoTask2(filterType2(checkType, filterString2)), trailingFunctionArgument2(arguments));
+      return this._runTask(
+        checkIsRepoTask2(filterType2(checkType, filterString2)),
+        trailingFunctionArgument2(arguments)
+      );
     };
     module.exports = Git2;
   }
@@ -54314,6 +54929,7 @@ init_task_configuration_error();
 init_check_is_repo();
 init_clean();
 init_config();
+init_diff_name_status();
 init_grep();
 init_reset();
 
@@ -54354,17 +54970,33 @@ function preventProtocolOverride(arg, next) {
   if (!/^\s*protocol(.[a-z]+)?.allow/.test(next)) {
     return;
   }
-  throw new GitPluginError(void 0, "unsafe", "Configuring protocol.allow is not permitted without enabling allowUnsafeExtProtocol");
+  throw new GitPluginError(
+    void 0,
+    "unsafe",
+    "Configuring protocol.allow is not permitted without enabling allowUnsafeExtProtocol"
+  );
 }
 function preventUploadPack(arg, method) {
   if (/^\s*--(upload|receive)-pack/.test(arg)) {
-    throw new GitPluginError(void 0, "unsafe", `Use of --upload-pack or --receive-pack is not permitted without enabling allowUnsafePack`);
+    throw new GitPluginError(
+      void 0,
+      "unsafe",
+      `Use of --upload-pack or --receive-pack is not permitted without enabling allowUnsafePack`
+    );
   }
   if (method === "clone" && /^\s*-u\b/.test(arg)) {
-    throw new GitPluginError(void 0, "unsafe", `Use of clone with option -u is not permitted without enabling allowUnsafePack`);
+    throw new GitPluginError(
+      void 0,
+      "unsafe",
+      `Use of clone with option -u is not permitted without enabling allowUnsafePack`
+    );
   }
   if (method === "push" && /^\s*--exec\b/.test(arg)) {
-    throw new GitPluginError(void 0, "unsafe", `Use of push with option --exec is not permitted without enabling allowUnsafePack`);
+    throw new GitPluginError(
+      void 0,
+      "unsafe",
+      `Use of push with option --exec is not permitted without enabling allowUnsafePack`
+    );
   }
 }
 function blockUnsafeOperationsPlugin({
@@ -54443,11 +55075,11 @@ function completionDetectionPlugin({
     type: "spawn.after",
     action(_0, _1) {
       return __async(this, arguments, function* (_data, { spawned, close }) {
-        var _a2, _b;
+        var _a3, _b;
         const events = createEvents();
         let deferClose = true;
         let quickClose = () => void (deferClose = false);
-        (_a2 = spawned.stdout) == null ? void 0 : _a2.on("data", quickClose);
+        (_a3 = spawned.stdout) == null ? void 0 : _a3.on("data", quickClose);
         (_b = spawned.stderr) == null ? void 0 : _b.on("data", quickClose);
         spawned.on("error", quickClose);
         spawned.on("close", (code) => events.close(code));
@@ -54464,6 +55096,44 @@ function completionDetectionPlugin({
       });
     }
   };
+}
+
+// src/lib/plugins/custom-binary.plugin.ts
+init_utils();
+var WRONG_NUMBER_ERR = `Invalid value supplied for custom binary, requires a single string or an array containing either one or two strings`;
+var WRONG_CHARS_ERR = `Invalid value supplied for custom binary, restricted characters must be removed or supply the unsafe.allowUnsafeCustomBinary option`;
+function isBadArgument(arg) {
+  return !arg || !/^([a-z]:)?([a-z0-9/.\\_-]+)$/i.test(arg);
+}
+function toBinaryConfig(input, allowUnsafe) {
+  if (input.length < 1 || input.length > 2) {
+    throw new GitPluginError(void 0, "binary", WRONG_NUMBER_ERR);
+  }
+  const isBad = input.some(isBadArgument);
+  if (isBad) {
+    if (allowUnsafe) {
+      console.warn(WRONG_CHARS_ERR);
+    } else {
+      throw new GitPluginError(void 0, "binary", WRONG_CHARS_ERR);
+    }
+  }
+  const [binary, prefix] = input;
+  return {
+    binary,
+    prefix
+  };
+}
+function customBinaryPlugin(plugins, input = ["git"], allowUnsafe = false) {
+  let config = toBinaryConfig(asArray(input), allowUnsafe);
+  plugins.on("binary", (input2) => {
+    config = toBinaryConfig(asArray(input2), allowUnsafe);
+  });
+  plugins.append("spawn.binary", () => {
+    return config.binary;
+  });
+  plugins.append("spawn.args", (data) => {
+    return config.prefix ? [config.prefix, ...data] : data;
+  });
 }
 
 // src/lib/plugins/error-detection.plugin.ts
@@ -54503,9 +55173,21 @@ function errorDetectionPlugin(config) {
 
 // src/lib/plugins/plugin-store.ts
 init_utils();
+
 var PluginStore = class {
   constructor() {
     this.plugins = /* @__PURE__ */ new Set();
+    this.events = new external_node_events_namespaceObject.EventEmitter();
+  }
+  on(type, listener) {
+    this.events.on(type, listener);
+  }
+  reconfigure(type, data) {
+    this.events.emit(type, data);
+  }
+  append(type, action) {
+    const plugin = append(this.plugins, { type, action });
+    return () => this.plugins.delete(plugin);
   }
   add(plugin) {
     const plugins = [];
@@ -54636,7 +55318,9 @@ function suffixPathsPlugin() {
           continue;
         }
         if (param === "--") {
-          append2(data.slice(i + 1).flatMap((item) => isPathSpec(item) && toPaths(item) || item));
+          append2(
+            data.slice(i + 1).flatMap((item) => isPathSpec(item) && toPaths(item) || item)
+          );
           break;
         }
         prefix.push(param);
@@ -54650,10 +55334,17 @@ function suffixPathsPlugin() {
 init_utils();
 var Git = require_git();
 function gitInstanceFactory(baseDir, options) {
+  var _a2;
   const plugins = new PluginStore();
-  const config = createInstanceConfig(baseDir && (typeof baseDir === "string" ? { baseDir } : baseDir) || {}, options);
+  const config = createInstanceConfig(
+    baseDir && (typeof baseDir === "string" ? { baseDir } : baseDir) || {},
+    options
+  );
   if (!folderExists(config.baseDir)) {
-    throw new GitConstructError(config, `Cannot use simple-git on a directory that does not exist`);
+    throw new GitConstructError(
+      config,
+      `Cannot use simple-git on a directory that does not exist`
+    );
   }
   if (Array.isArray(config.config)) {
     plugins.add(commandConfigPrefixingPlugin(config.config));
@@ -54667,6 +55358,7 @@ function gitInstanceFactory(baseDir, options) {
   config.spawnOptions && plugins.add(spawnOptionsPlugin(config.spawnOptions));
   plugins.add(errorDetectionPlugin(errorDetectionHandler(true)));
   config.errors && plugins.add(errorDetectionPlugin(config.errors));
+  customBinaryPlugin(plugins, config.binary, (_a2 = config.unsafe) == null ? void 0 : _a2.allowUnsafeCustomBinary);
   return new Git(config, plugins);
 }
 
@@ -54747,22 +55439,27 @@ function gitP(...args) {
   function chainReturn() {
     return chain;
   }
-  const promiseApi = [...functionNamesBuilderApi, ...functionNamesPromiseApi].reduce((api, name) => {
-    const isAsync = functionNamesPromiseApi.includes(name);
-    const valid = isAsync ? asyncWrapper(name, git) : syncWrapper(name, git, api);
-    const alternative = isAsync ? chainReturn : builderReturn;
-    Object.defineProperty(api, name, {
-      enumerable: false,
-      configurable: false,
-      value: git ? valid : alternative
-    });
-    return api;
-  }, {});
+  const promiseApi = [...functionNamesBuilderApi, ...functionNamesPromiseApi].reduce(
+    (api, name) => {
+      const isAsync = functionNamesPromiseApi.includes(name);
+      const valid = isAsync ? asyncWrapper(name, git) : syncWrapper(name, git, api);
+      const alternative = isAsync ? chainReturn : builderReturn;
+      Object.defineProperty(api, name, {
+        enumerable: false,
+        configurable: false,
+        value: git ? valid : alternative
+      });
+      return api;
+    },
+    {}
+  );
   return promiseApi;
   function asyncWrapper(fn, git2) {
     return function(...args2) {
       if (typeof args2[args2.length] === "function") {
-        throw new TypeError("Promise interface requires that handlers are not supplied inline, trailing function not allowed in call to " + fn);
+        throw new TypeError(
+          "Promise interface requires that handlers are not supplied inline, trailing function not allowed in call to " + fn
+        );
       }
       return chain.then(function() {
         return new Promise(function(resolve, reject) {
@@ -55630,6 +56327,11 @@ class DeltaOutpuItem {
     }
 }
 class Delta {
+    /** max message length for github commit messages
+     *  needed to truncate commit message when too many CVEs
+     *  were changed
+     */
+    static kMaxGithubCommitMessageLength = 65536;
     fetchTime;
     // durationInMsecs?: number;   // if not set, it means that it was not calculated
     numberOfChanges = 0;
@@ -55798,11 +56500,19 @@ class Delta {
         if (this.error.length > 0) {
             s += ` | ${this.error.length} other files`;
         }
-        const retstr = `${this.numberOfChanges} changes (${s}):
+        let retstr = `${this.numberOfChanges} changes (${s}):
       - ${this.new.length} new CVEs:  ${newCves.join(', ')}
       - ${this.updated.length} updated CVEs: ${updatedCves.join(', ')}
       ${this.error.length > 0 ? `- ${this.error.length} other files: ${unkownFiles.join(', ')}` : ``}
     `;
+        if (retstr.length > Delta.kMaxGithubCommitMessageLength) {
+            //  the '- 4' in the length is to accommodate the ',...' that lodash.truncate
+            // adds to the string when truncating
+            retstr = (0,lodash.truncate)(retstr, {
+                'length': Delta.kMaxGithubCommitMessageLength - 4,
+                'separator': ' '
+            });
+        }
         return retstr;
     }
     // ----- I/O ----- -----
@@ -56216,6 +56926,8 @@ const isFormData = (thing) => {
  */
 const isURLSearchParams = kindOfTest('URLSearchParams');
 
+const [isReadableStream, isRequest, isResponse, isHeaders] = ['ReadableStream', 'Request', 'Response', 'Headers'].map(kindOfTest);
+
 /**
  * Trim excess whitespace off the beginning and end of a string
  *
@@ -56604,8 +57316,7 @@ const toObjectSet = (arrayOrString, delimiter) => {
 const noop = () => {}
 
 const toFiniteNumber = (value, defaultValue) => {
-  value = +value;
-  return Number.isFinite(value) ? value : defaultValue;
+  return value != null && Number.isFinite(value = +value) ? value : defaultValue;
 }
 
 const ALPHA = 'abcdefghijklmnopqrstuvwxyz'
@@ -56686,6 +57397,10 @@ const isThenable = (thing) =>
   isBoolean,
   isObject,
   isPlainObject,
+  isReadableStream,
+  isRequest,
+  isResponse,
+  isHeaders,
   isUndefined,
   isDate,
   isFile,
@@ -57288,6 +58003,62 @@ var external_url_ = __nccwpck_require__(7310);
   protocols: [ 'http', 'https', 'file', 'data' ]
 });
 
+;// CONCATENATED MODULE: ./node_modules/axios/lib/platform/common/utils.js
+const hasBrowserEnv = typeof window !== 'undefined' && typeof document !== 'undefined';
+
+/**
+ * Determine if we're running in a standard browser environment
+ *
+ * This allows axios to run in a web worker, and react-native.
+ * Both environments support XMLHttpRequest, but not fully standard globals.
+ *
+ * web workers:
+ *  typeof window -> undefined
+ *  typeof document -> undefined
+ *
+ * react-native:
+ *  navigator.product -> 'ReactNative'
+ * nativescript
+ *  navigator.product -> 'NativeScript' or 'NS'
+ *
+ * @returns {boolean}
+ */
+const hasStandardBrowserEnv = (
+  (product) => {
+    return hasBrowserEnv && ['ReactNative', 'NativeScript', 'NS'].indexOf(product) < 0
+  })(typeof navigator !== 'undefined' && navigator.product);
+
+/**
+ * Determine if we're running in a standard browser webWorker environment
+ *
+ * Although the `isStandardBrowserEnv` method indicates that
+ * `allows axios to run in a web worker`, the WebWorker will still be
+ * filtered out due to its judgment standard
+ * `typeof window !== 'undefined' && typeof document !== 'undefined'`.
+ * This leads to a problem when axios post `FormData` in webWorker
+ */
+const hasStandardBrowserWebWorkerEnv = (() => {
+  return (
+    typeof WorkerGlobalScope !== 'undefined' &&
+    // eslint-disable-next-line no-undef
+    self instanceof WorkerGlobalScope &&
+    typeof self.importScripts === 'function'
+  );
+})();
+
+const origin = hasBrowserEnv && window.location.href || 'http://localhost';
+
+
+
+;// CONCATENATED MODULE: ./node_modules/axios/lib/platform/index.js
+
+
+
+/* harmony default export */ const platform = ({
+  ...common_utils_namespaceObject,
+  ...node
+});
+
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/toURLEncodedForm.js
 
 
@@ -57296,9 +58067,9 @@ var external_url_ = __nccwpck_require__(7310);
 
 
 function toURLEncodedForm(data, options) {
-  return helpers_toFormData(data, new node.classes.URLSearchParams(), Object.assign({
+  return helpers_toFormData(data, new platform.classes.URLSearchParams(), Object.assign({
     visitor: function(value, key, path, helpers) {
-      if (node.isNode && utils.isBuffer(value)) {
+      if (platform.isNode && utils.isBuffer(value)) {
         this.append(key, value.toString('base64'));
         return false;
       }
@@ -57360,6 +58131,9 @@ function arrayToObject(arr) {
 function formDataToJSON(formData) {
   function buildPath(path, value, target, index) {
     let name = path[index++];
+
+    if (name === '__proto__') return true;
+
     const isNumericKey = Number.isFinite(+name);
     const isLast = index >= path.length;
     name = !name && utils.isArray(target) ? target.length : name;
@@ -57442,7 +58216,7 @@ const defaults = {
 
   transitional: defaults_transitional,
 
-  adapter: node.isNode ? 'http' : 'xhr',
+  adapter: ['xhr', 'http', 'fetch'],
 
   transformRequest: [function transformRequest(data, headers) {
     const contentType = headers.getContentType() || '';
@@ -57456,9 +58230,6 @@ const defaults = {
     const isFormData = utils.isFormData(data);
 
     if (isFormData) {
-      if (!hasJSONContentType) {
-        return data;
-      }
       return hasJSONContentType ? JSON.stringify(helpers_formDataToJSON(data)) : data;
     }
 
@@ -57466,7 +58237,8 @@ const defaults = {
       utils.isBuffer(data) ||
       utils.isStream(data) ||
       utils.isFile(data) ||
-      utils.isBlob(data)
+      utils.isBlob(data) ||
+      utils.isReadableStream(data)
     ) {
       return data;
     }
@@ -57509,6 +58281,10 @@ const defaults = {
     const forcedJSONParsing = transitional && transitional.forcedJSONParsing;
     const JSONRequested = this.responseType === 'json';
 
+    if (utils.isResponse(data) || utils.isReadableStream(data)) {
+      return data;
+    }
+
     if (data && utils.isString(data) && ((forcedJSONParsing && !this.responseType) || JSONRequested)) {
       const silentJSONParsing = transitional && transitional.silentJSONParsing;
       const strictJSONParsing = !silentJSONParsing && JSONRequested;
@@ -57541,8 +58317,8 @@ const defaults = {
   maxBodyLength: -1,
 
   env: {
-    FormData: node.classes.FormData,
-    Blob: node.classes.Blob
+    FormData: platform.classes.FormData,
+    Blob: platform.classes.Blob
   },
 
   validateStatus: function validateStatus(status) {
@@ -57723,6 +58499,10 @@ class AxiosHeaders {
       setHeaders(header, valueOrRewrite)
     } else if(utils.isString(header) && (header = header.trim()) && !isValidHeaderName(header)) {
       setHeaders(parseHeaders(header), valueOrRewrite);
+    } else if (utils.isHeaders(header)) {
+      for (const [key, value] of header.entries()) {
+        setHeader(value, key, rewrite);
+      }
     } else {
       header != null && setHeader(valueOrRewrite, header, rewrite);
     }
@@ -58043,7 +58823,7 @@ function isAbsoluteURL(url) {
  */
 function combineURLs(baseURL, relativeURL) {
   return relativeURL
-    ? baseURL.replace(/\/+$/, '') + '/' + relativeURL.replace(/^\/+/, '')
+    ? baseURL.replace(/\/?\/$/, '') + '/' + relativeURL.replace(/^\/+/, '')
     : baseURL;
 }
 
@@ -58083,7 +58863,7 @@ var follow_redirects = __nccwpck_require__(7707);
 // EXTERNAL MODULE: external "zlib"
 var external_zlib_ = __nccwpck_require__(9796);
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/env/data.js
-const VERSION = "1.5.0";
+const VERSION = "1.7.2";
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/parseProtocol.js
 
 
@@ -58112,7 +58892,7 @@ const DATA_URL_PATTERN = /^(?:([^;]+);)?(?:[^;]+;)?(base64|),([\s\S]*)$/;
  * @returns {Buffer|Blob}
  */
 function fromDataURI(uri, asBlob, options) {
-  const _Blob = options && options.Blob || node.classes.Blob;
+  const _Blob = options && options.Blob || platform.classes.Blob;
   const protocol = parseProtocol(uri);
 
   if (asBlob === undefined && _Blob) {
@@ -58162,7 +58942,9 @@ function throttle(fn, freq) {
   let timestamp = 0;
   const threshold = 1000 / freq;
   let timer = null;
-  return function throttled(force, args) {
+  return function throttled() {
+    const force = this === true;
+
     const now = Date.now();
     if (force || now - timestamp > threshold) {
       if (timer) {
@@ -58170,13 +58952,13 @@ function throttle(fn, freq) {
         timer = null;
       }
       timestamp = now;
-      return fn.apply(null, args);
+      return fn.apply(null, arguments);
     }
     if (!timer) {
       timer = setTimeout(() => {
         timer = null;
         timestamp = Date.now();
-        return fn.apply(null, args);
+        return fn.apply(null, arguments);
       }, threshold - (now - timestamp));
     }
   };
@@ -58309,19 +59091,20 @@ class AxiosTransformStream extends external_stream_.Transform{
 
       process.nextTick(() => {
         self.emit('progress', {
-          'loaded': bytesTransferred,
-          'total': totalBytes,
-          'progress': totalBytes ? (bytesTransferred / totalBytes) : undefined,
-          'bytes': progressBytes,
-          'rate': rate ? rate : undefined,
-          'estimated': rate && totalBytes && bytesTransferred <= totalBytes ?
-            (totalBytes - bytesTransferred) / rate : undefined
+          loaded: bytesTransferred,
+          total: totalBytes,
+          progress: totalBytes ? (bytesTransferred / totalBytes) : undefined,
+          bytes: progressBytes,
+          rate: rate ? rate : undefined,
+          estimated: rate && totalBytes && bytesTransferred <= totalBytes ?
+            (totalBytes - bytesTransferred) / rate : undefined,
+          lengthComputable: totalBytes != null
         });
       });
     }, internals.ticksRate);
 
     const onFinish = () => {
-      internals.updateProgress(true);
+      internals.updateProgress.call(true);
     };
 
     this.once('end', onFinish);
@@ -58658,7 +59441,7 @@ const {http: httpFollow, https: httpsFollow} = follow_redirects;
 
 const isHttps = /https:?/;
 
-const supportedProtocols = node.protocols.map(protocol => {
+const supportedProtocols = platform.protocols.map(protocol => {
   return protocol + ':';
 });
 
@@ -58670,12 +59453,12 @@ const supportedProtocols = node.protocols.map(protocol => {
  *
  * @returns {Object<string, any>}
  */
-function dispatchBeforeRedirect(options) {
+function dispatchBeforeRedirect(options, responseDetails) {
   if (options.beforeRedirects.proxy) {
     options.beforeRedirects.proxy(options);
   }
   if (options.beforeRedirects.config) {
-    options.beforeRedirects.config(options);
+    options.beforeRedirects.config(options, responseDetails);
   }
 }
 
@@ -58761,6 +59544,18 @@ const wrapAsync = (asyncExecutor) => {
   })
 };
 
+const resolveFamily = ({address, family}) => {
+  if (!utils.isString(address)) {
+    throw TypeError('address must be a string');
+  }
+  return ({
+    address,
+    family: family || (address.indexOf('.') < 0 ? 6 : 4)
+  });
+}
+
+const buildAddressEntry = (address, family) => resolveFamily(utils.isObject(address) ? address : {address, family});
+
 /*eslint consistent-return:0*/
 /* harmony default export */ const http = (isHttpAdapterSupported && function httpAdapter(config) {
   return wrapAsync(async function dispatchHttpRequest(resolve, reject, onDone) {
@@ -58771,19 +59566,24 @@ const wrapAsync = (asyncExecutor) => {
     let rejected = false;
     let req;
 
-    if (lookup && utils.isAsyncFn(lookup)) {
-      lookup = helpers_callbackify(lookup, (entry) => {
-        if(utils.isString(entry)) {
-          entry = [entry, entry.indexOf('.') < 0 ? 6 : 4]
-        } else if (!utils.isArray(entry)) {
-          throw new TypeError('lookup async function must return an array [ip: string, family: number]]')
-        }
-        return entry;
-      })
+    if (lookup) {
+      const _lookup = helpers_callbackify(lookup, (value) => utils.isArray(value) ? value : [value]);
+      // hotfix to support opt.all option which is required for node 20.x
+      lookup = (hostname, opt, cb) => {
+        _lookup(hostname, opt, (err, arg0, arg1) => {
+          if (err) {
+            return cb(err);
+          }
+
+          const addresses = utils.isArray(arg0) ? arg0.map(addr => buildAddressEntry(addr)) : [buildAddressEntry(arg0, arg1)];
+
+          opt.all ? cb(err, addresses) : cb(err, addresses[0].address, addresses[0].family);
+        });
+      }
     }
 
     // temporary internal emitter until the AxiosRequest class will be implemented
-    const emitter = new external_events_();
+    const emitter = new external_events_.EventEmitter();
 
     const onFinished = () => {
       if (config.cancelToken) {
@@ -59088,7 +59888,7 @@ const wrapAsync = (asyncExecutor) => {
           delete res.headers['content-encoding'];
         }
 
-        switch (res.headers['content-encoding']) {
+        switch ((res.headers['content-encoding'] || '').toLowerCase()) {
         /*eslint default-case:0*/
         case 'gzip':
         case 'x-gzip':
@@ -59184,7 +59984,7 @@ const wrapAsync = (asyncExecutor) => {
             }
             response.data = responseData;
           } catch (err) {
-            reject(core_AxiosError.from(err, null, config, response.request, response));
+            return reject(core_AxiosError.from(err, null, config, response.request, response));
           }
           settle(resolve, reject, response);
         });
@@ -59221,7 +60021,7 @@ const wrapAsync = (asyncExecutor) => {
       // This is forcing a int timeout to avoid problems if the `req` interface doesn't handle other types.
       const timeout = parseInt(config.timeout, 10);
 
-      if (isNaN(timeout)) {
+      if (Number.isNaN(timeout)) {
         reject(new core_AxiosError(
           'error trying to parse `config.timeout` to int',
           core_AxiosError.ERR_BAD_OPTION_VALUE,
@@ -59284,59 +60084,39 @@ const wrapAsync = (asyncExecutor) => {
 
 const __setProxy = (/* unused pure expression or super */ null && (setProxy));
 
-;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/cookies.js
+;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/progressEventReducer.js
 
 
 
+/* harmony default export */ const progressEventReducer = ((listener, isDownloadStream, freq = 3) => {
+  let bytesNotified = 0;
+  const _speedometer = helpers_speedometer(50, 250);
 
+  return helpers_throttle(e => {
+    const loaded = e.loaded;
+    const total = e.lengthComputable ? e.total : undefined;
+    const progressBytes = loaded - bytesNotified;
+    const rate = _speedometer(progressBytes);
+    const inRange = loaded <= total;
 
-/* harmony default export */ const cookies = (node.isStandardBrowserEnv ?
+    bytesNotified = loaded;
 
-// Standard browser envs support document.cookie
-  (function standardBrowserEnv() {
-    return {
-      write: function write(name, value, expires, path, domain, secure) {
-        const cookie = [];
-        cookie.push(name + '=' + encodeURIComponent(value));
-
-        if (utils.isNumber(expires)) {
-          cookie.push('expires=' + new Date(expires).toGMTString());
-        }
-
-        if (utils.isString(path)) {
-          cookie.push('path=' + path);
-        }
-
-        if (utils.isString(domain)) {
-          cookie.push('domain=' + domain);
-        }
-
-        if (secure === true) {
-          cookie.push('secure');
-        }
-
-        document.cookie = cookie.join('; ');
-      },
-
-      read: function read(name) {
-        const match = document.cookie.match(new RegExp('(^|;\\s*)(' + name + ')=([^;]*)'));
-        return (match ? decodeURIComponent(match[3]) : null);
-      },
-
-      remove: function remove(name) {
-        this.write(name, '', Date.now() - 86400000);
-      }
+    const data = {
+      loaded,
+      total,
+      progress: total ? (loaded / total) : undefined,
+      bytes: progressBytes,
+      rate: rate ? rate : undefined,
+      estimated: rate && total && inRange ? (total - loaded) / rate : undefined,
+      event: e,
+      lengthComputable: total != null
     };
-  })() :
 
-// Non standard browser env (web workers, react-native) lack needed support.
-  (function nonStandardBrowserEnv() {
-    return {
-      write: function write() {},
-      read: function read() { return null; },
-      remove: function remove() {}
-    };
-  })());
+    data[isDownloadStream ? 'download' : 'upload'] = true;
+
+    listener(data);
+  }, freq);
+});
 
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/isURLSameOrigin.js
 
@@ -59344,7 +60124,7 @@ const __setProxy = (/* unused pure expression or super */ null && (setProxy));
 
 
 
-/* harmony default export */ const isURLSameOrigin = (node.isStandardBrowserEnv ?
+/* harmony default export */ const isURLSameOrigin = (platform.hasStandardBrowserEnv ?
 
 // Standard browser envs have full support of the APIs needed to test
 // whether the request URL is of the same origin as current location.
@@ -59354,7 +60134,7 @@ const __setProxy = (/* unused pure expression or super */ null && (setProxy));
     let originURL;
 
     /**
-    * Parse a URL to discover it's components
+    * Parse a URL to discover its components
     *
     * @param {String} url The URL to be parsed
     * @returns {Object}
@@ -59407,6 +60187,217 @@ const __setProxy = (/* unused pure expression or super */ null && (setProxy));
     };
   })());
 
+;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/cookies.js
+
+
+
+/* harmony default export */ const cookies = (platform.hasStandardBrowserEnv ?
+
+  // Standard browser envs support document.cookie
+  {
+    write(name, value, expires, path, domain, secure) {
+      const cookie = [name + '=' + encodeURIComponent(value)];
+
+      utils.isNumber(expires) && cookie.push('expires=' + new Date(expires).toGMTString());
+
+      utils.isString(path) && cookie.push('path=' + path);
+
+      utils.isString(domain) && cookie.push('domain=' + domain);
+
+      secure === true && cookie.push('secure');
+
+      document.cookie = cookie.join('; ');
+    },
+
+    read(name) {
+      const match = document.cookie.match(new RegExp('(^|;\\s*)(' + name + ')=([^;]*)'));
+      return (match ? decodeURIComponent(match[3]) : null);
+    },
+
+    remove(name) {
+      this.write(name, '', Date.now() - 86400000);
+    }
+  }
+
+  :
+
+  // Non-standard browser env (web workers, react-native) lack needed support.
+  {
+    write() {},
+    read() {
+      return null;
+    },
+    remove() {}
+  });
+
+
+;// CONCATENATED MODULE: ./node_modules/axios/lib/core/mergeConfig.js
+
+
+
+
+
+const headersToObject = (thing) => thing instanceof core_AxiosHeaders ? { ...thing } : thing;
+
+/**
+ * Config-specific merge-function which creates a new config-object
+ * by merging two configuration objects together.
+ *
+ * @param {Object} config1
+ * @param {Object} config2
+ *
+ * @returns {Object} New object resulting from merging config2 to config1
+ */
+function mergeConfig(config1, config2) {
+  // eslint-disable-next-line no-param-reassign
+  config2 = config2 || {};
+  const config = {};
+
+  function getMergedValue(target, source, caseless) {
+    if (utils.isPlainObject(target) && utils.isPlainObject(source)) {
+      return utils.merge.call({caseless}, target, source);
+    } else if (utils.isPlainObject(source)) {
+      return utils.merge({}, source);
+    } else if (utils.isArray(source)) {
+      return source.slice();
+    }
+    return source;
+  }
+
+  // eslint-disable-next-line consistent-return
+  function mergeDeepProperties(a, b, caseless) {
+    if (!utils.isUndefined(b)) {
+      return getMergedValue(a, b, caseless);
+    } else if (!utils.isUndefined(a)) {
+      return getMergedValue(undefined, a, caseless);
+    }
+  }
+
+  // eslint-disable-next-line consistent-return
+  function valueFromConfig2(a, b) {
+    if (!utils.isUndefined(b)) {
+      return getMergedValue(undefined, b);
+    }
+  }
+
+  // eslint-disable-next-line consistent-return
+  function defaultToConfig2(a, b) {
+    if (!utils.isUndefined(b)) {
+      return getMergedValue(undefined, b);
+    } else if (!utils.isUndefined(a)) {
+      return getMergedValue(undefined, a);
+    }
+  }
+
+  // eslint-disable-next-line consistent-return
+  function mergeDirectKeys(a, b, prop) {
+    if (prop in config2) {
+      return getMergedValue(a, b);
+    } else if (prop in config1) {
+      return getMergedValue(undefined, a);
+    }
+  }
+
+  const mergeMap = {
+    url: valueFromConfig2,
+    method: valueFromConfig2,
+    data: valueFromConfig2,
+    baseURL: defaultToConfig2,
+    transformRequest: defaultToConfig2,
+    transformResponse: defaultToConfig2,
+    paramsSerializer: defaultToConfig2,
+    timeout: defaultToConfig2,
+    timeoutMessage: defaultToConfig2,
+    withCredentials: defaultToConfig2,
+    withXSRFToken: defaultToConfig2,
+    adapter: defaultToConfig2,
+    responseType: defaultToConfig2,
+    xsrfCookieName: defaultToConfig2,
+    xsrfHeaderName: defaultToConfig2,
+    onUploadProgress: defaultToConfig2,
+    onDownloadProgress: defaultToConfig2,
+    decompress: defaultToConfig2,
+    maxContentLength: defaultToConfig2,
+    maxBodyLength: defaultToConfig2,
+    beforeRedirect: defaultToConfig2,
+    transport: defaultToConfig2,
+    httpAgent: defaultToConfig2,
+    httpsAgent: defaultToConfig2,
+    cancelToken: defaultToConfig2,
+    socketPath: defaultToConfig2,
+    responseEncoding: defaultToConfig2,
+    validateStatus: mergeDirectKeys,
+    headers: (a, b) => mergeDeepProperties(headersToObject(a), headersToObject(b), true)
+  };
+
+  utils.forEach(Object.keys(Object.assign({}, config1, config2)), function computeConfigValue(prop) {
+    const merge = mergeMap[prop] || mergeDeepProperties;
+    const configValue = merge(config1[prop], config2[prop], prop);
+    (utils.isUndefined(configValue) && merge !== mergeDirectKeys) || (config[prop] = configValue);
+  });
+
+  return config;
+}
+
+;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/resolveConfig.js
+
+
+
+
+
+
+
+
+
+/* harmony default export */ const resolveConfig = ((config) => {
+  const newConfig = mergeConfig({}, config);
+
+  let {data, withXSRFToken, xsrfHeaderName, xsrfCookieName, headers, auth} = newConfig;
+
+  newConfig.headers = headers = core_AxiosHeaders.from(headers);
+
+  newConfig.url = buildURL(buildFullPath(newConfig.baseURL, newConfig.url), config.params, config.paramsSerializer);
+
+  // HTTP basic authentication
+  if (auth) {
+    headers.set('Authorization', 'Basic ' +
+      btoa((auth.username || '') + ':' + (auth.password ? unescape(encodeURIComponent(auth.password)) : ''))
+    );
+  }
+
+  let contentType;
+
+  if (utils.isFormData(data)) {
+    if (platform.hasStandardBrowserEnv || platform.hasStandardBrowserWebWorkerEnv) {
+      headers.setContentType(undefined); // Let the browser set it
+    } else if ((contentType = headers.getContentType()) !== false) {
+      // fix semicolon duplication issue for ReactNative FormData implementation
+      const [type, ...tokens] = contentType ? contentType.split(';').map(token => token.trim()).filter(Boolean) : [];
+      headers.setContentType([type || 'multipart/form-data', ...tokens].join('; '));
+    }
+  }
+
+  // Add xsrf header
+  // This is only done if running in a standard browser environment.
+  // Specifically not if we're in a web worker, or react-native.
+
+  if (platform.hasStandardBrowserEnv) {
+    withXSRFToken && utils.isFunction(withXSRFToken) && (withXSRFToken = withXSRFToken(newConfig));
+
+    if (withXSRFToken || (withXSRFToken !== false && isURLSameOrigin(newConfig.url))) {
+      // Add xsrf header
+      const xsrfValue = xsrfHeaderName && xsrfCookieName && cookies.read(xsrfCookieName);
+
+      if (xsrfValue) {
+        headers.set(xsrfHeaderName, xsrfValue);
+      }
+    }
+  }
+
+  return newConfig;
+});
+
+
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/adapters/xhr.js
 
 
@@ -59419,81 +60410,31 @@ const __setProxy = (/* unused pure expression or super */ null && (setProxy));
 
 
 
-
-
-
-
-
-function progressEventReducer(listener, isDownloadStream) {
-  let bytesNotified = 0;
-  const _speedometer = helpers_speedometer(50, 250);
-
-  return e => {
-    const loaded = e.loaded;
-    const total = e.lengthComputable ? e.total : undefined;
-    const progressBytes = loaded - bytesNotified;
-    const rate = _speedometer(progressBytes);
-    const inRange = loaded <= total;
-
-    bytesNotified = loaded;
-
-    const data = {
-      loaded,
-      total,
-      progress: total ? (loaded / total) : undefined,
-      bytes: progressBytes,
-      rate: rate ? rate : undefined,
-      estimated: rate && total && inRange ? (total - loaded) / rate : undefined,
-      event: e
-    };
-
-    data[isDownloadStream ? 'download' : 'upload'] = true;
-
-    listener(data);
-  };
-}
-
 const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
 
 /* harmony default export */ const xhr = (isXHRAdapterSupported && function (config) {
   return new Promise(function dispatchXhrRequest(resolve, reject) {
-    let requestData = config.data;
-    const requestHeaders = core_AxiosHeaders.from(config.headers).normalize();
-    const responseType = config.responseType;
+    const _config = resolveConfig(config);
+    let requestData = _config.data;
+    const requestHeaders = core_AxiosHeaders.from(_config.headers).normalize();
+    let {responseType} = _config;
     let onCanceled;
     function done() {
-      if (config.cancelToken) {
-        config.cancelToken.unsubscribe(onCanceled);
+      if (_config.cancelToken) {
+        _config.cancelToken.unsubscribe(onCanceled);
       }
 
-      if (config.signal) {
-        config.signal.removeEventListener('abort', onCanceled);
-      }
-    }
-
-    if (utils.isFormData(requestData)) {
-      if (node.isStandardBrowserEnv || node.isStandardBrowserWebWorkerEnv) {
-        requestHeaders.setContentType(false); // Let the browser set it
-      } else {
-        requestHeaders.setContentType('multipart/form-data;', false); // mobile/desktop app frameworks
+      if (_config.signal) {
+        _config.signal.removeEventListener('abort', onCanceled);
       }
     }
 
     let request = new XMLHttpRequest();
 
-    // HTTP basic authentication
-    if (config.auth) {
-      const username = config.auth.username || '';
-      const password = config.auth.password ? unescape(encodeURIComponent(config.auth.password)) : '';
-      requestHeaders.set('Authorization', 'Basic ' + btoa(username + ':' + password));
-    }
-
-    const fullPath = buildFullPath(config.baseURL, config.url);
-
-    request.open(config.method.toUpperCase(), buildURL(fullPath, config.params, config.paramsSerializer), true);
+    request.open(_config.method.toUpperCase(), _config.url, true);
 
     // Set the request timeout in MS
-    request.timeout = config.timeout;
+    request.timeout = _config.timeout;
 
     function onloadend() {
       if (!request) {
@@ -59555,7 +60496,7 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
         return;
       }
 
-      reject(new core_AxiosError('Request aborted', core_AxiosError.ECONNABORTED, config, request));
+      reject(new core_AxiosError('Request aborted', core_AxiosError.ECONNABORTED, _config, request));
 
       // Clean up request
       request = null;
@@ -59565,7 +60506,7 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
     request.onerror = function handleError() {
       // Real errors are hidden from us by the browser
       // onerror should only fire if it's a network error
-      reject(new core_AxiosError('Network Error', core_AxiosError.ERR_NETWORK, config, request));
+      reject(new core_AxiosError('Network Error', core_AxiosError.ERR_NETWORK, _config, request));
 
       // Clean up request
       request = null;
@@ -59573,33 +60514,20 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
 
     // Handle timeout
     request.ontimeout = function handleTimeout() {
-      let timeoutErrorMessage = config.timeout ? 'timeout of ' + config.timeout + 'ms exceeded' : 'timeout exceeded';
-      const transitional = config.transitional || defaults_transitional;
-      if (config.timeoutErrorMessage) {
-        timeoutErrorMessage = config.timeoutErrorMessage;
+      let timeoutErrorMessage = _config.timeout ? 'timeout of ' + _config.timeout + 'ms exceeded' : 'timeout exceeded';
+      const transitional = _config.transitional || defaults_transitional;
+      if (_config.timeoutErrorMessage) {
+        timeoutErrorMessage = _config.timeoutErrorMessage;
       }
       reject(new core_AxiosError(
         timeoutErrorMessage,
         transitional.clarifyTimeoutError ? core_AxiosError.ETIMEDOUT : core_AxiosError.ECONNABORTED,
-        config,
+        _config,
         request));
 
       // Clean up request
       request = null;
     };
-
-    // Add xsrf header
-    // This is only done if running in a standard browser environment.
-    // Specifically not if we're in a web worker, or react-native.
-    if (node.isStandardBrowserEnv) {
-      // Add xsrf header
-      const xsrfValue = (config.withCredentials || isURLSameOrigin(fullPath))
-        && config.xsrfCookieName && cookies.read(config.xsrfCookieName);
-
-      if (xsrfValue) {
-        requestHeaders.set(config.xsrfHeaderName, xsrfValue);
-      }
-    }
 
     // Remove Content-Type if data is undefined
     requestData === undefined && requestHeaders.setContentType(null);
@@ -59612,26 +60540,26 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
     }
 
     // Add withCredentials to request if needed
-    if (!utils.isUndefined(config.withCredentials)) {
-      request.withCredentials = !!config.withCredentials;
+    if (!utils.isUndefined(_config.withCredentials)) {
+      request.withCredentials = !!_config.withCredentials;
     }
 
     // Add responseType to request if needed
     if (responseType && responseType !== 'json') {
-      request.responseType = config.responseType;
+      request.responseType = _config.responseType;
     }
 
     // Handle progress if needed
-    if (typeof config.onDownloadProgress === 'function') {
-      request.addEventListener('progress', progressEventReducer(config.onDownloadProgress, true));
+    if (typeof _config.onDownloadProgress === 'function') {
+      request.addEventListener('progress', progressEventReducer(_config.onDownloadProgress, true));
     }
 
     // Not all browsers support upload events
-    if (typeof config.onUploadProgress === 'function' && request.upload) {
-      request.upload.addEventListener('progress', progressEventReducer(config.onUploadProgress));
+    if (typeof _config.onUploadProgress === 'function' && request.upload) {
+      request.upload.addEventListener('progress', progressEventReducer(_config.onUploadProgress));
     }
 
-    if (config.cancelToken || config.signal) {
+    if (_config.cancelToken || _config.signal) {
       // Handle cancellation
       // eslint-disable-next-line func-names
       onCanceled = cancel => {
@@ -59643,15 +60571,15 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
         request = null;
       };
 
-      config.cancelToken && config.cancelToken.subscribe(onCanceled);
-      if (config.signal) {
-        config.signal.aborted ? onCanceled() : config.signal.addEventListener('abort', onCanceled);
+      _config.cancelToken && _config.cancelToken.subscribe(onCanceled);
+      if (_config.signal) {
+        _config.signal.aborted ? onCanceled() : _config.signal.addEventListener('abort', onCanceled);
       }
     }
 
-    const protocol = parseProtocol(fullPath);
+    const protocol = parseProtocol(_config.url);
 
-    if (protocol && node.protocols.indexOf(protocol) === -1) {
+    if (protocol && platform.protocols.indexOf(protocol) === -1) {
       reject(new core_AxiosError('Unsupported protocol ' + protocol + ':', core_AxiosError.ERR_BAD_REQUEST, config));
       return;
     }
@@ -59662,7 +60590,342 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
   });
 });
 
+;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/composeSignals.js
+
+
+
+const composeSignals = (signals, timeout) => {
+  let controller = new AbortController();
+
+  let aborted;
+
+  const onabort = function (cancel) {
+    if (!aborted) {
+      aborted = true;
+      unsubscribe();
+      const err = cancel instanceof Error ? cancel : this.reason;
+      controller.abort(err instanceof core_AxiosError ? err : new cancel_CanceledError(err instanceof Error ? err.message : err));
+    }
+  }
+
+  let timer = timeout && setTimeout(() => {
+    onabort(new core_AxiosError(`timeout ${timeout} of ms exceeded`, core_AxiosError.ETIMEDOUT))
+  }, timeout)
+
+  const unsubscribe = () => {
+    if (signals) {
+      timer && clearTimeout(timer);
+      timer = null;
+      signals.forEach(signal => {
+        signal &&
+        (signal.removeEventListener ? signal.removeEventListener('abort', onabort) : signal.unsubscribe(onabort));
+      });
+      signals = null;
+    }
+  }
+
+  signals.forEach((signal) => signal && signal.addEventListener && signal.addEventListener('abort', onabort));
+
+  const {signal} = controller;
+
+  signal.unsubscribe = unsubscribe;
+
+  return [signal, () => {
+    timer && clearTimeout(timer);
+    timer = null;
+  }];
+}
+
+/* harmony default export */ const helpers_composeSignals = (composeSignals);
+
+;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/trackStream.js
+
+
+const streamChunk = function* (chunk, chunkSize) {
+  let len = chunk.byteLength;
+
+  if (!chunkSize || len < chunkSize) {
+    yield chunk;
+    return;
+  }
+
+  let pos = 0;
+  let end;
+
+  while (pos < len) {
+    end = pos + chunkSize;
+    yield chunk.slice(pos, end);
+    pos = end;
+  }
+}
+
+const readBytes = async function* (iterable, chunkSize, encode) {
+  for await (const chunk of iterable) {
+    yield* streamChunk(ArrayBuffer.isView(chunk) ? chunk : (await encode(String(chunk))), chunkSize);
+  }
+}
+
+const trackStream = (stream, chunkSize, onProgress, onFinish, encode) => {
+  const iterator = readBytes(stream, chunkSize, encode);
+
+  let bytes = 0;
+
+  return new ReadableStream({
+    type: 'bytes',
+
+    async pull(controller) {
+      const {done, value} = await iterator.next();
+
+      if (done) {
+        controller.close();
+        onFinish();
+        return;
+      }
+
+      let len = value.byteLength;
+      onProgress && onProgress(bytes += len);
+      controller.enqueue(new Uint8Array(value));
+    },
+    cancel(reason) {
+      onFinish(reason);
+      return iterator.return();
+    }
+  }, {
+    highWaterMark: 2
+  })
+}
+
+;// CONCATENATED MODULE: ./node_modules/axios/lib/adapters/fetch.js
+
+
+
+
+
+
+
+
+
+
+const fetchProgressDecorator = (total, fn) => {
+  const lengthComputable = total != null;
+  return (loaded) => setTimeout(() => fn({
+    lengthComputable,
+    total,
+    loaded
+  }));
+}
+
+const isFetchSupported = typeof fetch === 'function' && typeof Request === 'function' && typeof Response === 'function';
+const isReadableStreamSupported = isFetchSupported && typeof ReadableStream === 'function';
+
+// used only inside the fetch adapter
+const encodeText = isFetchSupported && (typeof TextEncoder === 'function' ?
+    ((encoder) => (str) => encoder.encode(str))(new TextEncoder()) :
+    async (str) => new Uint8Array(await new Response(str).arrayBuffer())
+);
+
+const supportsRequestStream = isReadableStreamSupported && (() => {
+  let duplexAccessed = false;
+
+  const hasContentType = new Request(platform.origin, {
+    body: new ReadableStream(),
+    method: 'POST',
+    get duplex() {
+      duplexAccessed = true;
+      return 'half';
+    },
+  }).headers.has('Content-Type');
+
+  return duplexAccessed && !hasContentType;
+})();
+
+const DEFAULT_CHUNK_SIZE = 64 * 1024;
+
+const supportsResponseStream = isReadableStreamSupported && !!(()=> {
+  try {
+    return utils.isReadableStream(new Response('').body);
+  } catch(err) {
+    // return undefined
+  }
+})();
+
+const resolvers = {
+  stream: supportsResponseStream && ((res) => res.body)
+};
+
+isFetchSupported && (((res) => {
+  ['text', 'arrayBuffer', 'blob', 'formData', 'stream'].forEach(type => {
+    !resolvers[type] && (resolvers[type] = utils.isFunction(res[type]) ? (res) => res[type]() :
+      (_, config) => {
+        throw new core_AxiosError(`Response type '${type}' is not supported`, core_AxiosError.ERR_NOT_SUPPORT, config);
+      })
+  });
+})(new Response));
+
+const getBodyLength = async (body) => {
+  if (body == null) {
+    return 0;
+  }
+
+  if(utils.isBlob(body)) {
+    return body.size;
+  }
+
+  if(utils.isSpecCompliantForm(body)) {
+    return (await new Request(body).arrayBuffer()).byteLength;
+  }
+
+  if(utils.isArrayBufferView(body)) {
+    return body.byteLength;
+  }
+
+  if(utils.isURLSearchParams(body)) {
+    body = body + '';
+  }
+
+  if(utils.isString(body)) {
+    return (await encodeText(body)).byteLength;
+  }
+}
+
+const resolveBodyLength = async (headers, body) => {
+  const length = utils.toFiniteNumber(headers.getContentLength());
+
+  return length == null ? getBodyLength(body) : length;
+}
+
+/* harmony default export */ const adapters_fetch = (isFetchSupported && (async (config) => {
+  let {
+    url,
+    method,
+    data,
+    signal,
+    cancelToken,
+    timeout,
+    onDownloadProgress,
+    onUploadProgress,
+    responseType,
+    headers,
+    withCredentials = 'same-origin',
+    fetchOptions
+  } = resolveConfig(config);
+
+  responseType = responseType ? (responseType + '').toLowerCase() : 'text';
+
+  let [composedSignal, stopTimeout] = (signal || cancelToken || timeout) ?
+    helpers_composeSignals([signal, cancelToken], timeout) : [];
+
+  let finished, request;
+
+  const onFinish = () => {
+    !finished && setTimeout(() => {
+      composedSignal && composedSignal.unsubscribe();
+    });
+
+    finished = true;
+  }
+
+  let requestContentLength;
+
+  try {
+    if (
+      onUploadProgress && supportsRequestStream && method !== 'get' && method !== 'head' &&
+      (requestContentLength = await resolveBodyLength(headers, data)) !== 0
+    ) {
+      let _request = new Request(url, {
+        method: 'POST',
+        body: data,
+        duplex: "half"
+      });
+
+      let contentTypeHeader;
+
+      if (utils.isFormData(data) && (contentTypeHeader = _request.headers.get('content-type'))) {
+        headers.setContentType(contentTypeHeader)
+      }
+
+      if (_request.body) {
+        data = trackStream(_request.body, DEFAULT_CHUNK_SIZE, fetchProgressDecorator(
+          requestContentLength,
+          progressEventReducer(onUploadProgress)
+        ), null, encodeText);
+      }
+    }
+
+    if (!utils.isString(withCredentials)) {
+      withCredentials = withCredentials ? 'cors' : 'omit';
+    }
+
+    request = new Request(url, {
+      ...fetchOptions,
+      signal: composedSignal,
+      method: method.toUpperCase(),
+      headers: headers.normalize().toJSON(),
+      body: data,
+      duplex: "half",
+      withCredentials
+    });
+
+    let response = await fetch(request);
+
+    const isStreamResponse = supportsResponseStream && (responseType === 'stream' || responseType === 'response');
+
+    if (supportsResponseStream && (onDownloadProgress || isStreamResponse)) {
+      const options = {};
+
+      ['status', 'statusText', 'headers'].forEach(prop => {
+        options[prop] = response[prop];
+      });
+
+      const responseContentLength = utils.toFiniteNumber(response.headers.get('content-length'));
+
+      response = new Response(
+        trackStream(response.body, DEFAULT_CHUNK_SIZE, onDownloadProgress && fetchProgressDecorator(
+          responseContentLength,
+          progressEventReducer(onDownloadProgress, true)
+        ), isStreamResponse && onFinish, encodeText),
+        options
+      );
+    }
+
+    responseType = responseType || 'text';
+
+    let responseData = await resolvers[utils.findKey(resolvers, responseType) || 'text'](response, config);
+
+    !isStreamResponse && onFinish();
+
+    stopTimeout && stopTimeout();
+
+    return await new Promise((resolve, reject) => {
+      settle(resolve, reject, {
+        data: responseData,
+        headers: core_AxiosHeaders.from(response.headers),
+        status: response.status,
+        statusText: response.statusText,
+        config,
+        request
+      })
+    })
+  } catch (err) {
+    onFinish();
+
+    if (err && err.name === 'TypeError' && /fetch/i.test(err.message)) {
+      throw Object.assign(
+        new core_AxiosError('Network Error', core_AxiosError.ERR_NETWORK, config, request),
+        {
+          cause: err.cause || err
+        }
+      )
+    }
+
+    throw core_AxiosError.from(err, err && err.code, config, request);
+  }
+}));
+
+
+
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/adapters/adapters.js
+
 
 
 
@@ -59670,11 +60933,12 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
 
 const knownAdapters = {
   http: http,
-  xhr: xhr
+  xhr: xhr,
+  fetch: adapters_fetch
 }
 
 utils.forEach(knownAdapters, (fn, value) => {
-  if(fn) {
+  if (fn) {
     try {
       Object.defineProperty(fn, 'name', {value});
     } catch (e) {
@@ -59684,6 +60948,10 @@ utils.forEach(knownAdapters, (fn, value) => {
   }
 });
 
+const renderReason = (reason) => `- ${reason}`;
+
+const isResolvedHandle = (adapter) => utils.isFunction(adapter) || adapter === null || adapter === false;
+
 /* harmony default export */ const adapters = ({
   getAdapter: (adapters) => {
     adapters = utils.isArray(adapters) ? adapters : [adapters];
@@ -59692,30 +60960,44 @@ utils.forEach(knownAdapters, (fn, value) => {
     let nameOrAdapter;
     let adapter;
 
+    const rejectedReasons = {};
+
     for (let i = 0; i < length; i++) {
       nameOrAdapter = adapters[i];
-      if((adapter = utils.isString(nameOrAdapter) ? knownAdapters[nameOrAdapter.toLowerCase()] : nameOrAdapter)) {
+      let id;
+
+      adapter = nameOrAdapter;
+
+      if (!isResolvedHandle(nameOrAdapter)) {
+        adapter = knownAdapters[(id = String(nameOrAdapter)).toLowerCase()];
+
+        if (adapter === undefined) {
+          throw new core_AxiosError(`Unknown adapter '${id}'`);
+        }
+      }
+
+      if (adapter) {
         break;
       }
+
+      rejectedReasons[id || '#' + i] = adapter;
     }
 
     if (!adapter) {
-      if (adapter === false) {
-        throw new core_AxiosError(
-          `Adapter ${nameOrAdapter} is not supported by the environment`,
-          'ERR_NOT_SUPPORT'
+
+      const reasons = Object.entries(rejectedReasons)
+        .map(([id, state]) => `adapter ${id} ` +
+          (state === false ? 'is not supported by the environment' : 'is not available in the build')
         );
-      }
 
-      throw new Error(
-        utils.hasOwnProp(knownAdapters, nameOrAdapter) ?
-          `Adapter '${nameOrAdapter}' is not available in the build` :
-          `Unknown adapter '${nameOrAdapter}'`
+      let s = length ?
+        (reasons.length > 1 ? 'since :\n' + reasons.map(renderReason).join('\n') : ' ' + renderReason(reasons[0])) :
+        'as no adapter specified';
+
+      throw new core_AxiosError(
+        `There is no suitable adapter to dispatch the request ` + s,
+        'ERR_NOT_SUPPORT'
       );
-    }
-
-    if (!utils.isFunction(adapter)) {
-      throw new TypeError('adapter is not a function');
     }
 
     return adapter;
@@ -59804,113 +61086,6 @@ function dispatchRequest(config) {
 
     return Promise.reject(reason);
   });
-}
-
-;// CONCATENATED MODULE: ./node_modules/axios/lib/core/mergeConfig.js
-
-
-
-
-
-const headersToObject = (thing) => thing instanceof core_AxiosHeaders ? thing.toJSON() : thing;
-
-/**
- * Config-specific merge-function which creates a new config-object
- * by merging two configuration objects together.
- *
- * @param {Object} config1
- * @param {Object} config2
- *
- * @returns {Object} New object resulting from merging config2 to config1
- */
-function mergeConfig(config1, config2) {
-  // eslint-disable-next-line no-param-reassign
-  config2 = config2 || {};
-  const config = {};
-
-  function getMergedValue(target, source, caseless) {
-    if (utils.isPlainObject(target) && utils.isPlainObject(source)) {
-      return utils.merge.call({caseless}, target, source);
-    } else if (utils.isPlainObject(source)) {
-      return utils.merge({}, source);
-    } else if (utils.isArray(source)) {
-      return source.slice();
-    }
-    return source;
-  }
-
-  // eslint-disable-next-line consistent-return
-  function mergeDeepProperties(a, b, caseless) {
-    if (!utils.isUndefined(b)) {
-      return getMergedValue(a, b, caseless);
-    } else if (!utils.isUndefined(a)) {
-      return getMergedValue(undefined, a, caseless);
-    }
-  }
-
-  // eslint-disable-next-line consistent-return
-  function valueFromConfig2(a, b) {
-    if (!utils.isUndefined(b)) {
-      return getMergedValue(undefined, b);
-    }
-  }
-
-  // eslint-disable-next-line consistent-return
-  function defaultToConfig2(a, b) {
-    if (!utils.isUndefined(b)) {
-      return getMergedValue(undefined, b);
-    } else if (!utils.isUndefined(a)) {
-      return getMergedValue(undefined, a);
-    }
-  }
-
-  // eslint-disable-next-line consistent-return
-  function mergeDirectKeys(a, b, prop) {
-    if (prop in config2) {
-      return getMergedValue(a, b);
-    } else if (prop in config1) {
-      return getMergedValue(undefined, a);
-    }
-  }
-
-  const mergeMap = {
-    url: valueFromConfig2,
-    method: valueFromConfig2,
-    data: valueFromConfig2,
-    baseURL: defaultToConfig2,
-    transformRequest: defaultToConfig2,
-    transformResponse: defaultToConfig2,
-    paramsSerializer: defaultToConfig2,
-    timeout: defaultToConfig2,
-    timeoutMessage: defaultToConfig2,
-    withCredentials: defaultToConfig2,
-    adapter: defaultToConfig2,
-    responseType: defaultToConfig2,
-    xsrfCookieName: defaultToConfig2,
-    xsrfHeaderName: defaultToConfig2,
-    onUploadProgress: defaultToConfig2,
-    onDownloadProgress: defaultToConfig2,
-    decompress: defaultToConfig2,
-    maxContentLength: defaultToConfig2,
-    maxBodyLength: defaultToConfig2,
-    beforeRedirect: defaultToConfig2,
-    transport: defaultToConfig2,
-    httpAgent: defaultToConfig2,
-    httpsAgent: defaultToConfig2,
-    cancelToken: defaultToConfig2,
-    socketPath: defaultToConfig2,
-    responseEncoding: defaultToConfig2,
-    validateStatus: mergeDirectKeys,
-    headers: (a, b) => mergeDeepProperties(headersToObject(a), headersToObject(b), true)
-  };
-
-  utils.forEach(Object.keys(Object.assign({}, config1, config2)), function computeConfigValue(prop) {
-    const merge = mergeMap[prop] || mergeDeepProperties;
-    const configValue = merge(config1[prop], config2[prop], prop);
-    (utils.isUndefined(configValue) && merge !== mergeDirectKeys) || (config[prop] = configValue);
-  });
-
-  return config;
 }
 
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/validator.js
@@ -60044,7 +61219,34 @@ class Axios {
    *
    * @returns {Promise} The Promise to be fulfilled
    */
-  request(configOrUrl, config) {
+  async request(configOrUrl, config) {
+    try {
+      return await this._request(configOrUrl, config);
+    } catch (err) {
+      if (err instanceof Error) {
+        let dummy;
+
+        Error.captureStackTrace ? Error.captureStackTrace(dummy = {}) : (dummy = new Error());
+
+        // slice off the Error: ... line
+        const stack = dummy.stack ? dummy.stack.replace(/^.+\n/, '') : '';
+        try {
+          if (!err.stack) {
+            err.stack = stack;
+            // match without the 2 top stack lines
+          } else if (stack && !String(err.stack).endsWith(stack.replace(/^.+\n.+\n/, ''))) {
+            err.stack += '\n' + stack
+          }
+        } catch (e) {
+          // ignore the case where "stack" is an un-writable property
+        }
+      }
+
+      throw err;
+    }
+  }
+
+  _request(configOrUrl, config) {
     /*eslint no-param-reassign:0*/
     // Allow for axios('example/url'[, config]) a la fetch API
     if (typeof configOrUrl === 'string') {
@@ -61122,7 +62324,7 @@ main.config();
  *  The format follows semver for released software: Major.Minor.Patch, e.g., `1.0.0` with an optional '-mitre-' for "MITRE-only" releases
  *  In addition, before release, it uses the version number that it branched from, and appends it with `+feature_YYYY-MM-DD`, e.g., `1.0.1+twitter_2023-08-02`.
  */
-const version = `1.1.0`;
+const version = `1.1.1`;
 
 const main_program = new MainCommands(version);
 (async () => {

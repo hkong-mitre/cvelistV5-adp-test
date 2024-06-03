@@ -45,6 +45,11 @@ export declare class DeltaOutpuItem {
     };
 }
 export declare class Delta {
+    /** max message length for github commit messages
+     *  needed to truncate commit message when too many CVEs
+     *  were changed
+     */
+    static kMaxGithubCommitMessageLength: number;
     fetchTime?: string;
     numberOfChanges: number;
     new: CveCorePlus[];
