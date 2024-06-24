@@ -2,7 +2,7 @@
 >
 > For actual CVEs, use https://github.com/CVEProject/cvelistV5 instead
 >
-> As of 2024-05-29T20:58:28.850Z, this repository can be considered a complete cache for the adp-test server
+> As of 2024-05-29T20:58:28.850Z, this repository can be considered a cache for the adp-test server.  We've noted issues with it mid-June, however, and are working to fix them.
 
 # CVE List V5
 
