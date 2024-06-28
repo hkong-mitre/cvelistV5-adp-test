@@ -10,6 +10,8 @@ on:
   #   the next job will run 5 minutes after this completes
   schedule:
     - cron: '*/5 * * * *'
+  branches:
+      - adp-test-6-28
   # Enables manual runs of this workflow from the Actions tab
   workflow_dispatch:
     inputs:
